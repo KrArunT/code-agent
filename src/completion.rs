@@ -23,6 +23,7 @@ const COMMANDS: &[&str] = &[
     "/permissions",
     "/provider",
     "/read",
+    "/attach",
     "/shell",
     "/show-thinking",
     "/stop",
@@ -94,6 +95,14 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
             let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
             let arg_prefix = &prefix[arg_start..];
             (arg_start, path_pairs(workspace, arg_prefix))
+        }
+        "/attach" => {
+            let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
+            let arg_prefix = &prefix[arg_start..];
+            match parts.get(1).copied() {
+                Some("file") | Some("image") => (arg_start, path_pairs(workspace, arg_prefix)),
+                _ => complete_words(current_word(prefix).1, &["show", "clear", "file", "image"]),
+            }
         }
         "/permissions" => complete_words(
             current_word(prefix).1,

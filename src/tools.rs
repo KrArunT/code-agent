@@ -23,6 +23,7 @@ pub struct ToolRuntime {
     workspace: PathBuf,
     shell_permission: PermissionMode,
     write_permission: PermissionMode,
+    full_system_access: bool,
 }
 
 impl ToolRuntime {
@@ -30,11 +31,13 @@ impl ToolRuntime {
         workspace: PathBuf,
         shell_permission: PermissionMode,
         write_permission: PermissionMode,
+        full_system_access: bool,
     ) -> Self {
         Self {
             workspace,
             shell_permission,
             write_permission,
+            full_system_access,
         }
     }
 
@@ -44,6 +47,10 @@ impl ToolRuntime {
 
     pub fn write_permission(&self) -> PermissionMode {
         self.write_permission
+    }
+
+    pub fn full_system_access(&self) -> bool {
+        self.full_system_access
     }
 
     pub fn set_shell_permission(&mut self, permission: PermissionMode) {
@@ -90,12 +97,12 @@ impl ToolRuntime {
     }
 
     pub fn read_file(&self, path: &str) -> Result<String> {
-        let path = self.safe_path(path)?;
+        let path = self.resolve_path(path)?;
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String> {
-        let path = self.safe_path(path)?;
+        let path = self.resolve_path(path)?;
         match approve(self.write_permission, &format!("write {}?", path.display()))? {
             Approval::Approved => {}
             Approval::Cancelled => return Ok("write cancelled by user".to_string()),
@@ -107,6 +114,10 @@ impl ToolRuntime {
         }
         fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(format!("wrote {}", path.display()))
+    }
+
+    pub fn resolve_path(&self, path: &str) -> Result<PathBuf> {
+        self.safe_path(path)
     }
 
     pub async fn run_shell(&self, command: &str) -> Result<String> {
@@ -139,14 +150,19 @@ impl ToolRuntime {
     fn safe_path(&self, path: &str) -> Result<PathBuf> {
         let requested = Path::new(path);
         if requested.is_absolute() {
-            return Err(anyhow!("absolute paths are not allowed: {path}"));
+            if self.full_system_access {
+                return Ok(requested.to_path_buf());
+            }
+            return Err(anyhow!(
+                "absolute paths are not allowed without --full-system-access: {path}"
+            ));
         }
         let joined = self.workspace.join(requested);
         let parent = joined.parent().unwrap_or(&self.workspace);
         let canonical_parent = parent
             .canonicalize()
             .with_context(|| format!("path parent is not accessible: {}", parent.display()))?;
-        if !canonical_parent.starts_with(&self.workspace) {
+        if !self.full_system_access && !canonical_parent.starts_with(&self.workspace) {
             return Err(anyhow!("path escapes workspace: {path}"));
         }
         Ok(joined)

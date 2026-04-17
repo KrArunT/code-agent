@@ -9,8 +9,11 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Streaming responses for all provider paths.
 - Markdown rendering for streamed assistant/tool output: headings, lists, quotes, inline code, bold text, and fenced code blocks.
 - Tab completion for slash commands, command arguments, and workspace paths.
+- Optional `ratatui` full-screen mode behind `--tui` with help overlay, scrollback, and input history.
+- Configurable startup banner and onboarding help in both line mode and `--tui`.
 - Workspace tools for file listing, file reads, file writes, and shell execution.
 - Approval modes for shell commands and writes: `ask`, `allow`, or `deny`.
+- Full system access mode for trusted sessions with absolute paths, workspace escapes, shell, and writes enabled.
 - Shell runner mode plus full terminal passthrough mode.
 - Ollama thinking controls and stop sequences.
 
@@ -34,6 +37,12 @@ Use a specific Ollama model:
 cargo run -- --model gemma3:270m
 ```
 
+Start the full-screen Ratatui interface:
+
+```bash
+cargo run -- --tui --model gemma3:270m
+```
+
 Disable visible/thinking-model traces and allow shell/write actions without prompts:
 
 ```bash
@@ -45,6 +54,31 @@ Use stricter permissions:
 ```bash
 cargo run -- --approval-mode ask --shell-approval deny --write-approval ask
 ```
+
+Run with full system access for a trusted local session:
+
+```bash
+cargo run -- --full-system-access
+```
+
+`--full-system-access` permits absolute paths, paths outside the workspace, shell commands, and writes without approval prompts. Use it only when you intend to give the agent broad local-machine access.
+
+If you want the stricter workspace-scoped mode, omit `--full-system-access`. The UI labels the current access level as `workspace` or `full-system` so it stays visible during the session.
+
+## Banner
+
+The startup banner is configurable from CLI arguments or environment variables. The defaults are `AutoFix` and `An autonomous coding agent`:
+
+```bash
+cargo run -- \
+  --banner-title "kernel-backport-bot" \
+  --banner-subtitle "linux patch migration helper" \
+  --banner-tip "start with the upstream commit SHA" \
+  --banner-onboarding "/help commands" \
+  --banner-onboarding "/terminal real shell"
+```
+
+The same banner settings are used by the line-mode startup banner, the `--clear` redraw, and the Ratatui header. If you omit the onboarding flags, the default onboarding lines are used.
 
 ## Providers
 
@@ -89,6 +123,8 @@ CUSTOM_API_KEY=... cargo run -- \
 
 ## System Prompt
 
+By default, the built-in system prompt configures the agent as an autonomous Linux kernel backporting agent. It is optimized for inspecting upstream commits, adapting patches to a target kernel tree, resolving conflicts semantically, preserving kernel style, and running focused verification.
+
 Pass a system prompt directly:
 
 ```bash
@@ -111,6 +147,19 @@ cargo run -- --system "$(cat system-prompt.txt)"
 
 Press `Tab` to complete slash commands and workspace paths.
 
+The default line-mode UI supports the full command set below. The `--tui` full-screen mode currently supports chat plus `/help`, `/provider`, `/models`, `/use-model`, `/thinking`, `/clear`, and `/exit`; line mode remains available for shell, terminal passthrough, writes, and the full command surface while the Ratatui path is iterating.
+Both modes start with an onboarding block that points you at `/help`, `/models`, `/permissions`, `/terminal`, and the backporting workflow.
+
+TUI navigation:
+
+- `?` toggles the help overlay.
+- `PgUp` and `PgDn` scroll the transcript.
+- `Home` and `End` jump to the top or bottom of the transcript.
+- `Up` and `Down` browse command history when the input box is empty.
+- Mouse wheel scrolls the transcript.
+- Drag or click the scrollbar to reposition the transcript.
+- The bottom hint line shows the current shortcut summary inside the full-screen UI.
+
 Core commands:
 
 - `/help` shows command help.
@@ -125,6 +174,10 @@ Workspace commands:
 - `/list [path]` lists files under the workspace.
 - `/read <path>` prints a file.
 - `/write <path>` writes content until a line containing only `.`.
+- `/attach file <path>` queues a file to prepend to the next prompt.
+- `/attach image <path>` queues an image reference and metadata to prepend to the next prompt.
+- `/attach show` shows queued prompt attachments.
+- `/attach clear` clears queued prompt attachments.
 
 Shell commands:
 
@@ -143,6 +196,14 @@ Permissions:
 - `/permissions deny` denies shell commands and writes.
 - `/permissions shell <ask|allow|deny>` changes shell approval only.
 - `/permissions write <ask|allow|deny>` changes write approval only.
+
+Full system access:
+
+- `--full-system-access` enables broad local access.
+- In this mode, file tools can read/write absolute paths and paths outside the workspace.
+- Shell and write permissions are treated as `allow`.
+- Startup status and `/provider` show `access=full-system`.
+- The same access label appears in the Ratatui status panel and startup banner.
 
 Ollama thinking and stops:
 

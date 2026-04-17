@@ -9,12 +9,46 @@ const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
 const BLUE: &str = "\x1b[34m";
 const BG_DARK: &str = "\x1b[48;5;236m";
+const BANNER_WIDTH: usize = 54;
+const BANNER_INNER_WIDTH: usize = 50;
 
-pub fn banner(provider: &str, model: &str, workspace: &str) {
-    println!("{BOLD}{CYAN}coding-agent-rs{RESET}");
-    println!("{DIM}provider{RESET} {provider}  {DIM}model{RESET} {model}");
+pub fn banner(
+    title: &str,
+    subtitle: &str,
+    provider: &str,
+    model: &str,
+    workspace: &str,
+    access: &str,
+    onboarding: &[String],
+    tip: &str,
+) {
+    let title = center_banner_text(title, BANNER_INNER_WIDTH);
+    let subtitle = center_banner_text(subtitle, BANNER_INNER_WIDTH);
+    println!("{}", banner_border('╔', '═', '╗', BANNER_WIDTH));
+    println!("{}", banner_empty_line(BANNER_WIDTH));
+    println!("{BOLD}{CYAN}║ {title} ║{RESET}");
+    println!("{BOLD}{CYAN}║ {subtitle} ║{RESET}");
+    println!("{}", banner_empty_line(BANNER_WIDTH));
+    println!("{}", banner_border('╚', '═', '╝', BANNER_WIDTH));
+    println!(
+        "{DIM}provider{RESET} {provider}  {DIM}model{RESET} {model}  {DIM}access{RESET} {access}"
+    );
     println!("{DIM}workspace{RESET} {workspace}");
-    println!("{DIM}type /help for commands, /exit to quit{RESET}");
+    if access == "full-system" {
+        println!("{BOLD}{RED}warning>{RESET} full system access is enabled: absolute paths, path escapes, shell, and writes are allowed");
+    }
+    if onboarding.is_empty() {
+        println!("{BOLD}{YELLOW}onboarding>{RESET} /help commands  /models local models  /permissions safety  /terminal real shell  /exit quit");
+    } else {
+        for (idx, line) in onboarding.iter().enumerate() {
+            if idx == 0 {
+                println!("{BOLD}{YELLOW}onboarding>{RESET} {line}");
+            } else {
+                println!("{DIM}           {RESET} {line}");
+            }
+        }
+    }
+    println!("{DIM}tip{RESET} {tip}");
     println!();
 }
 
@@ -225,6 +259,40 @@ pub fn divider() {
     println!("{DIM}------------------------------------------------------------{RESET}");
 }
 
+fn fit_banner_text(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for ch in text.chars().take(max_chars) {
+        output.push(ch);
+    }
+    output
+}
+
+fn center_banner_text(text: &str, width: usize) -> String {
+    let text = fit_banner_text(text, width);
+    let len = text.chars().count();
+    if len >= width {
+        return text;
+    }
+
+    let left = (width - len) / 2;
+    let right = width - len - left;
+    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+}
+
+fn banner_border(left: char, fill: char, right: char, width: usize) -> String {
+    format!(
+        "{BOLD}{CYAN}{left}{}{right}{RESET}",
+        fill.to_string().repeat(width.saturating_sub(2))
+    )
+}
+
+fn banner_empty_line(width: usize) -> String {
+    format!(
+        "{BOLD}{CYAN}║{}║{RESET}",
+        " ".repeat(width.saturating_sub(2))
+    )
+}
+
 pub fn clear_screen() -> io::Result<()> {
     print!("\x1b[2J\x1b[H");
     io::stdout().flush()
@@ -254,6 +322,10 @@ pub fn help_text() -> &'static str {
   /list [path]       list workspace files
   /read <path>       read a file
   /write <path>      write a file; finish input with a single '.'
+  /attach file <path> append a file to the next prompt
+  /attach image <path> append an image reference to the next prompt
+  /attach show       show queued prompt attachments
+  /attach clear      clear queued prompt attachments
   /shell             enter shell mode
   /shell <command>   run one shell command with confirmation
   !<command>         run one shell command from chat mode

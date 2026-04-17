@@ -14,5 +14,9 @@ use config::Config;
 async fn main() -> Result<()> {
     let config = Config::parse().resolve().await?;
     let mut agent = Agent::new(config)?;
-    agent.run().await
+    if agent.is_tui_enabled() {
+        agent.run_tui().await
+    } else {
+        agent.run().await
+    }
 }

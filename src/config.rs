@@ -78,6 +78,32 @@ pub struct Config {
 
     #[arg(long = "stop", env = "AGENT_STOP", value_delimiter = ',')]
     pub stop_sequences: Vec<String>,
+
+    #[arg(long, env = "AGENT_TUI")]
+    pub tui: bool,
+
+    #[arg(long, env = "AGENT_FULL_SYSTEM_ACCESS")]
+    pub full_system_access: bool,
+
+    #[arg(long, env = "AGENT_BANNER_TITLE", default_value = "AutoFix")]
+    pub banner_title: String,
+
+    #[arg(
+        long,
+        env = "AGENT_BANNER_SUBTITLE",
+        default_value = "An autonomous coding agent"
+    )]
+    pub banner_subtitle: String,
+
+    #[arg(
+        long,
+        env = "AGENT_BANNER_TIP",
+        default_value = "start with a backport commit ID, target kernel version, or a local patch series"
+    )]
+    pub banner_tip: String,
+
+    #[arg(long = "banner-onboarding", env = "AGENT_BANNER_ONBOARDING")]
+    pub banner_onboarding: Vec<String>,
 }
 
 impl Config {
@@ -151,7 +177,7 @@ impl Config {
     }
 
     pub fn shell_permission(&self) -> PermissionMode {
-        if self.dangerously_allow_shell {
+        if self.full_system_access || self.dangerously_allow_shell {
             PermissionMode::Allow
         } else {
             self.shell_approval.unwrap_or(self.approval_mode)
@@ -159,10 +185,32 @@ impl Config {
     }
 
     pub fn write_permission(&self) -> PermissionMode {
-        if self.auto_write {
+        if self.full_system_access || self.auto_write {
             PermissionMode::Allow
         } else {
             self.write_approval.unwrap_or(self.approval_mode)
+        }
+    }
+
+    pub fn access_label(&self) -> &'static str {
+        if self.full_system_access {
+            "full-system"
+        } else {
+            "workspace"
+        }
+    }
+
+    pub fn banner_onboarding(&self) -> Vec<String> {
+        if self.banner_onboarding.is_empty() {
+            vec![
+                "/help commands".to_string(),
+                "/models local models".to_string(),
+                "/permissions safety".to_string(),
+                "/terminal real shell".to_string(),
+                "/exit quit".to_string(),
+            ]
+        } else {
+            self.banner_onboarding.clone()
         }
     }
 }
