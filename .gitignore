@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Runtime logs and local scratch files
+*.log
+*.tmp
+tmp/
+logs/
+
+# Local model/provider config that may contain keys
+config.local.*
+*.local.toml

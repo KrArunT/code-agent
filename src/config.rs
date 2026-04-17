@@ -1,0 +1,239 @@
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, ValueEnum};
+use serde::Deserialize;
+use std::{env, path::PathBuf};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ProviderKind {
+    Openai,
+    Anthropic,
+    Gemini,
+    Ollama,
+    Openrouter,
+    CustomOpenai,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ThinkMode {
+    Auto,
+    On,
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum PermissionMode {
+    Ask,
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "coding-agent-rs")]
+#[command(about = "Interactive coding agent with multi-provider support")]
+pub struct Config {
+    #[arg(long, value_enum, env = "AGENT_PROVIDER", default_value = "ollama")]
+    pub provider: ProviderKind,
+
+    #[arg(long, env = "AGENT_MODEL")]
+    pub model: Option<String>,
+
+    #[arg(long, env = "AGENT_BASE_URL")]
+    pub base_url: Option<String>,
+
+    #[arg(long, env = "AGENT_API_KEY")]
+    pub api_key: Option<String>,
+
+    #[arg(long, env = "AGENT_WORKSPACE", default_value = ".")]
+    pub workspace: PathBuf,
+
+    #[arg(long, env = "AGENT_SYSTEM_PROMPT")]
+    pub system: Option<String>,
+
+    #[arg(long, env = "AGENT_ALLOW_SHELL")]
+    pub dangerously_allow_shell: bool,
+
+    #[arg(long, env = "AGENT_AUTO_WRITE")]
+    pub auto_write: bool,
+
+    #[arg(long, value_enum, env = "AGENT_APPROVAL_MODE", default_value = "ask")]
+    pub approval_mode: PermissionMode,
+
+    #[arg(long, value_enum, env = "AGENT_SHELL_APPROVAL")]
+    pub shell_approval: Option<PermissionMode>,
+
+    #[arg(long, value_enum, env = "AGENT_WRITE_APPROVAL")]
+    pub write_approval: Option<PermissionMode>,
+
+    #[arg(long, env = "AGENT_MAX_TOOL_ROUNDS", default_value_t = 6)]
+    pub max_tool_rounds: usize,
+
+    #[arg(long, value_enum, env = "AGENT_THINK", default_value = "auto")]
+    pub think: ThinkMode,
+
+    #[arg(long, env = "AGENT_HIDE_THINKING")]
+    pub hide_thinking: bool,
+
+    #[arg(long = "stop", env = "AGENT_STOP", value_delimiter = ',')]
+    pub stop_sequences: Vec<String>,
+}
+
+impl Config {
+    pub async fn resolve(mut self) -> Result<Self> {
+        self.workspace = self.workspace.canonicalize().map_err(|err| {
+            anyhow!(
+                "workspace '{}' is not accessible: {err}",
+                self.workspace.display()
+            )
+        })?;
+
+        if self.api_key.is_none() {
+            self.api_key = match self.provider {
+                ProviderKind::Openai => env::var("OPENAI_API_KEY").ok(),
+                ProviderKind::Anthropic => env::var("ANTHROPIC_API_KEY").ok(),
+                ProviderKind::Gemini => env::var("GEMINI_API_KEY").ok(),
+                ProviderKind::Openrouter => env::var("OPENROUTER_API_KEY").ok(),
+                ProviderKind::CustomOpenai => env::var("CUSTOM_API_KEY").ok(),
+                ProviderKind::Ollama => None,
+            };
+        }
+
+        if self.api_key.is_none() && !matches!(self.provider, ProviderKind::Ollama) {
+            return Err(anyhow!(
+                "missing API key; pass --api-key or set the provider-specific env var"
+            ));
+        }
+
+        if self.base_url.is_none() {
+            self.base_url = Some(
+                match self.provider {
+                    ProviderKind::Openai => "https://api.openai.com/v1/chat/completions",
+                    ProviderKind::Anthropic => "https://api.anthropic.com/v1/messages",
+                    ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+                    ProviderKind::Ollama => "http://localhost:11434/api/chat",
+                    ProviderKind::Openrouter => "https://openrouter.ai/api/v1/chat/completions",
+                    ProviderKind::CustomOpenai => {
+                        return Err(anyhow!("--base-url is required for custom-openai"));
+                    }
+                }
+                .to_string(),
+            );
+        }
+
+        if self.model.is_none() {
+            self.model = Some(match self.provider {
+                ProviderKind::Openai => "gpt-4.1-mini".to_string(),
+                ProviderKind::Anthropic => "claude-3-5-sonnet-latest".to_string(),
+                ProviderKind::Gemini => "gemini-1.5-pro".to_string(),
+                ProviderKind::Ollama => pick_ollama_model(self.base_url()).await?,
+                ProviderKind::Openrouter => "openai/gpt-4.1-mini".to_string(),
+                ProviderKind::CustomOpenai => {
+                    return Err(anyhow!("--model is required for custom-openai"));
+                }
+            });
+        }
+
+        Ok(self)
+    }
+
+    pub fn model(&self) -> &str {
+        self.model.as_deref().expect("model is resolved")
+    }
+
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_deref().expect("base_url is resolved")
+    }
+
+    pub fn show_thinking(&self) -> bool {
+        !self.hide_thinking
+    }
+
+    pub fn shell_permission(&self) -> PermissionMode {
+        if self.dangerously_allow_shell {
+            PermissionMode::Allow
+        } else {
+            self.shell_approval.unwrap_or(self.approval_mode)
+        }
+    }
+
+    pub fn write_permission(&self) -> PermissionMode {
+        if self.auto_write {
+            PermissionMode::Allow
+        } else {
+            self.write_approval.unwrap_or(self.approval_mode)
+        }
+    }
+}
+
+impl ThinkMode {
+    pub fn as_request_value(self) -> Option<serde_json::Value> {
+        match self {
+            ThinkMode::Auto => None,
+            ThinkMode::On => Some(serde_json::Value::Bool(true)),
+            ThinkMode::Off => Some(serde_json::Value::Bool(false)),
+            ThinkMode::Low => Some(serde_json::Value::String("low".to_string())),
+            ThinkMode::Medium => Some(serde_json::Value::String("medium".to_string())),
+            ThinkMode::High => Some(serde_json::Value::String("high".to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTags {
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModel {
+    name: String,
+}
+
+async fn pick_ollama_model(base_url: &str) -> Result<String> {
+    let models = list_ollama_models(base_url).await?;
+    if models.is_empty() {
+        return Err(anyhow!(
+            "Ollama is running but has no local models. Pull one first, for example: ollama pull lfm"
+        ));
+    }
+
+    let picked = models
+        .iter()
+        .find(|name| name.as_str() == "lfm")
+        .or_else(|| models.iter().find(|name| name.starts_with("lfm:")))
+        .or_else(|| models.iter().find(|name| name.contains("lfm")))
+        .unwrap_or(&models[0]);
+
+    Ok(picked.clone())
+}
+
+pub async fn list_ollama_models(base_url: &str) -> Result<Vec<String>> {
+    let tags_url = ollama_tags_url(base_url);
+    let tags: OllamaTags = reqwest::Client::new()
+        .get(&tags_url)
+        .send()
+        .await
+        .with_context(|| format!("failed to query local Ollama models at {tags_url}"))?
+        .error_for_status()
+        .with_context(|| format!("Ollama model list returned an error at {tags_url}"))?
+        .json()
+        .await
+        .context("Ollama model list response was not JSON")?;
+
+    let mut models = tags
+        .models
+        .into_iter()
+        .map(|model| model.name)
+        .collect::<Vec<_>>();
+    models.sort();
+    Ok(models)
+}
+
+fn ollama_tags_url(base_url: &str) -> String {
+    if let Some(prefix) = base_url.strip_suffix("/api/chat") {
+        format!("{prefix}/api/tags")
+    } else {
+        format!("{}/api/tags", base_url.trim_end_matches('/'))
+    }
+}
