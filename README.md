@@ -31,7 +31,7 @@ One-line install:
 curl -fsSL https://raw.githubusercontent.com/KrArunT/code-agent/main/install.sh | bash
 ```
 
-The script uses `cargo install --git` under the hood. You can override the repository, branch, or install root with environment variables:
+The script bootstraps Rust with `rustup` if `cargo` is missing, then uses `cargo install --git` under the hood. You can override the repository, branch, or install root with environment variables:
 
 ```bash
 REPO_URL=https://github.com/KrArunT/code-agent.git BRANCH=main INSTALL_ROOT=$HOME/.local curl -fsSL https://raw.githubusercontent.com/KrArunT/code-agent/main/install.sh | bash
