@@ -22,6 +22,28 @@ pub enum ToolCall {
     ReadWorker { id: String },
 }
 
+impl ToolCall {
+    pub fn summary(&self) -> String {
+        match self {
+            ToolCall::ListFiles { path } => {
+                format!("list_files path={}", path.as_deref().unwrap_or("."))
+            }
+            ToolCall::ReadFile { path } => format!("read_file path={path}"),
+            ToolCall::WriteFile { path, content } => {
+                format!("write_file path={path} bytes={}", content.len())
+            }
+            ToolCall::RunShell { command } => format!("run_shell command={command}"),
+            ToolCall::SpawnWorker { name, task } => format!(
+                "spawn_worker name={} task={}",
+                name.as_deref().unwrap_or("worker"),
+                task.lines().next().unwrap_or("").trim()
+            ),
+            ToolCall::ListWorkers => "list_workers".to_string(),
+            ToolCall::ReadWorker { id } => format!("read_worker id={id}"),
+        }
+    }
+}
+
 pub struct ToolRuntime {
     workspace: PathBuf,
     shell_permission: PermissionMode,

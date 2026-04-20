@@ -8,6 +8,7 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Provider adapters for OpenAI-compatible APIs, Anthropic, Gemini, OpenRouter, Ollama, and custom OpenAI-compatible gateways.
 - Streaming responses for all provider paths.
 - Markdown rendering for streamed assistant/tool output: headings, lists, quotes, inline code, bold text, and fenced code blocks.
+- Live progress updates in the terminal and TUI status panel while the agent thinks, calls tools, or runs workers.
 - Tab completion for slash commands, command arguments, and workspace paths.
 - Optional `ratatui` full-screen mode behind `--tui` with help overlay, scrollback, and input history.
 - Configurable startup banner and onboarding help in both line mode and `--tui`.
@@ -363,10 +364,14 @@ Mode behavior:
 
 ## Agent Tool Calls
 
-The model can request a tool call by returning one fenced JSON block:
+The model can request one or more tool calls by returning fenced JSON blocks:
 
 ```json
 {"tool":"read_file","path":"src/main.rs"}
+```
+
+```json
+{"tool":"list_files","path":"src"}
 ```
 
 Supported tools:
@@ -375,8 +380,12 @@ Supported tools:
 - `read_file`: `{ "tool": "read_file", "path": "src/main.rs" }`
 - `write_file`: `{ "tool": "write_file", "path": "notes.txt", "content": "..." }`
 - `run_shell`: `{ "tool": "run_shell", "command": "cargo test" }`
+- `spawn_worker`: `{ "tool": "spawn_worker", "name": "parser", "task": "..." }`
+- `list_workers`: `{ "tool": "list_workers" }`
+- `read_worker`: `{ "tool": "read_worker", "id": "worker-id" }`
 
 Tool paths are workspace-relative. Absolute paths and parent-directory escapes are rejected.
+Multiple fenced tool blocks in one assistant message are executed in order before the next model turn. That reduces unnecessary loop turns and makes the agent behave more like a Codex-style controller.
 
 ## Notes
 

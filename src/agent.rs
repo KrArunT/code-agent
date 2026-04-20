@@ -56,6 +56,7 @@ pub struct Agent {
     memory_store: MemoryStore,
     skills: Vec<LoadedSkill>,
     completion_workspace: Arc<Mutex<PathBuf>>,
+    progress: String,
 }
 
 const MAX_TUI_HISTORY: usize = 400;
@@ -88,6 +89,7 @@ impl Agent {
             memory_store,
             skills,
             completion_workspace: Arc::new(Mutex::new(completion_workspace)),
+            progress: String::new(),
         })
     }
 
@@ -155,6 +157,7 @@ impl Agent {
             });
             self.respond().await?;
             self.update_plan_file("response").await?;
+            self.clear_progress();
         }
         Ok(())
     }
@@ -186,6 +189,8 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| "worker".to_string());
 
+        self.set_progress(format!("worker {worker_id}: loading task"));
+
         let mut record = load_worker_record(&self.config.workspace, &worker_id)?;
         record.status = WorkerStatus::Running;
         record.updated_at = now_epoch();
@@ -215,11 +220,13 @@ impl Agent {
             Ok(_) => {
                 finished.status = WorkerStatus::Finished;
                 finished.exit_status = Some(0);
+                self.set_progress(format!("worker {worker_id}: finished"));
             }
             Err(err) => {
                 finished.status = WorkerStatus::Failed;
                 finished.exit_status = Some(1);
                 finished.task = format!("{}\n\nworker error: {err}", finished.task);
+                self.set_progress(format!("worker {worker_id}: failed"));
             }
         }
         save_worker_record(&self.config.workspace, &finished)?;
@@ -428,6 +435,7 @@ impl Agent {
                             });
                             status = "ready".to_string();
                             self.update_plan_file("response").await?;
+                            self.clear_progress();
                             needs_draw = true;
                         }
                         _ => {}
@@ -794,8 +802,9 @@ impl Agent {
             ui::error("no shell command provided");
             return Ok(());
         }
+        ui::tool_start(&format!("run_shell command={command}"));
         let result = self.tools.run_shell(command).await?;
-        ui::tool_result(&result);
+        ui::tool_result("run_shell", &result);
         Ok(())
     }
 
@@ -1138,6 +1147,7 @@ impl Agent {
     async fn spawn_worker(&mut self, name: Option<String>, task: String) -> Result<String> {
         let worker_name = name.unwrap_or_else(|| "worker".to_string());
         let worker_id = make_worker_id(&worker_name);
+        self.set_progress(format!("spawning worker {worker_id}"));
         let new_workspace = self.create_worker_worktree_path(&worker_id)?;
         let branch = self.worker_branch_name(&worker_id)?;
         let worktree_path = new_workspace.to_string_lossy().to_string();
@@ -1229,6 +1239,7 @@ impl Agent {
         record.status = WorkerStatus::Running;
         record.updated_at = now_epoch();
         save_worker_record(&self.config.workspace, &record)?;
+        self.set_progress(format!("worker {worker_id} running"));
 
         Ok(format!(
             "spawned worker {worker_id}\nbranch: {branch}\nworkspace: {}\npid: {}\ntask: {}",
@@ -1593,8 +1604,25 @@ impl Agent {
         }
     }
 
+    fn set_progress(&mut self, message: impl Into<String>) {
+        self.progress = message.into();
+        if !self.config.tui {
+            ui::info(&format!("progress: {}", self.progress));
+        }
+    }
+
+    fn clear_progress(&mut self) {
+        self.progress.clear();
+    }
+
     async fn respond(&mut self) -> Result<()> {
-        for _ in 0..=self.config.effective_max_tool_rounds() {
+        let total_rounds = self.config.effective_max_tool_rounds();
+        for round in 0..=total_rounds {
+            self.set_progress(format!(
+                "round {}/{}: thinking",
+                round + 1,
+                total_rounds + 1
+            ));
             ui::assistant_start()?;
             let mut showed_thinking = false;
             let mut showed_answer = false;
@@ -1640,12 +1668,15 @@ impl Agent {
                 content: answer.clone(),
             });
 
-            let tool_call = match extract_tool_call(&answer) {
-                Ok(Some(tool_call)) => tool_call,
-                Ok(None) => return Ok(()),
+            let tool_calls = match extract_tool_calls(&answer) {
+                Ok(tool_calls) if tool_calls.is_empty() => {
+                    self.set_progress("complete");
+                    return Ok(());
+                }
+                Ok(tool_calls) => tool_calls,
                 Err(err) => {
                     let message = format!(
-                        "tool call parse error: {err}\nReturn either a final answer or a single valid ```json tool block."
+                        "tool call parse error: {err}\nReturn either a final answer or one or more valid ```json tool blocks."
                     );
                     ui::error(&message);
                     self.messages.push(Message {
@@ -1656,17 +1687,38 @@ impl Agent {
                 }
             };
 
-            let result = match self.execute_tool_call(tool_call).await {
-                Ok(result) => result,
-                Err(err) => format!("tool execution error: {err}"),
+            let tool_total = tool_calls.len();
+            let mut result_lines = Vec::new();
+            for (index, tool_call) in tool_calls.into_iter().enumerate() {
+                let tool_label = tool_call.summary();
+                self.set_progress(format!(
+                    "round {}/{}: executing {} ({}/{})",
+                    round + 1,
+                    total_rounds + 1,
+                    tool_label,
+                    index + 1,
+                    tool_total
+                ));
+                ui::tool_start(&tool_label);
+                let result = match self.execute_tool_call(tool_call).await {
+                    Ok(result) => result,
+                    Err(err) => format!("tool execution error: {err}"),
+                };
+                ui::tool_result(&tool_label, &result);
+                result_lines.push(format!("{}: {result}", index + 1));
+            }
+            let result = if result_lines.len() == 1 {
+                result_lines.remove(0)
+            } else {
+                format!("Tool results:\n{}", result_lines.join("\n"))
             };
-            ui::tool_result(&result);
             self.messages.push(Message {
                 role: Role::User,
                 content: format!("Tool result:\n{result}"),
             });
         }
 
+        self.set_progress("stopped after max tool rounds");
         ui::error("stopped after max tool rounds");
         Ok(())
     }
@@ -2257,6 +2309,14 @@ fn draw_tui(
         let status_panel = Paragraph::new(vec![
             Line::from(format!("status: {status}")),
             Line::from(format!(
+                "progress: {}",
+                if agent.progress.is_empty() {
+                    "idle"
+                } else {
+                    agent.progress.as_str()
+                }
+            )),
+            Line::from(format!(
                 "perm: shell={:?} write={:?}",
                 agent.tools.shell_permission(),
                 agent.tools.write_permission()
@@ -2756,18 +2816,34 @@ fn format_stop_sequences(stops: &[String]) -> String {
     }
 }
 
-fn extract_tool_call(text: &str) -> Result<Option<ToolCall>> {
-    let Some(start) = text.find("```json") else {
-        return Ok(None);
-    };
-    let json_start = start + "```json".len();
-    let Some(end) = text[json_start..].find("```") else {
-        return Ok(None);
-    };
-    let json_text = &text[json_start..json_start + end];
-    let call = serde_json::from_str::<ToolCall>(json_text.trim())
-        .with_context(|| format!("failed to parse tool call JSON: {json_text}"))?;
-    Ok(Some(call))
+fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(start) = text[search_start..].find("```json") {
+        let start = search_start + start;
+        let json_start = start + "```json".len();
+        let Some(end) = text[json_start..].find("```") else {
+            break;
+        };
+        let json_text = &text[json_start..json_start + end];
+        let block = json_text.trim();
+        if block.is_empty() {
+            search_start = json_start + end + "```".len();
+            continue;
+        }
+
+        if let Ok(batch) = serde_json::from_str::<Vec<ToolCall>>(block) {
+            calls.extend(batch);
+        } else {
+            let call = serde_json::from_str::<ToolCall>(block)
+                .with_context(|| format!("failed to parse tool call JSON: {json_text}"))?;
+            calls.push(call);
+        }
+        search_start = json_start + end + "```".len();
+    }
+
+    Ok(calls)
 }
 
 fn default_system_prompt() -> String {
@@ -2802,7 +2878,7 @@ Response style:
 - Include file paths and concrete function or symbol names when explaining changes.
 - When blocked, state the blocker and the next best action.
 
-You can ask to use tools by returning exactly one fenced JSON block:
+You can ask to use tools by returning one or more fenced JSON blocks:
 ```json
 {"tool":"read_file","path":"src/main.rs"}
 ```

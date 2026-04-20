@@ -176,8 +176,12 @@ pub fn stream_reset() -> io::Result<()> {
     io::stdout().flush()
 }
 
-pub fn tool_result(result: &str) {
-    print!("{BOLD}{MAGENTA}tool>{RESET} ");
+pub fn tool_start(label: &str) {
+    println!("{BOLD}{MAGENTA}tool>{RESET} {label}");
+}
+
+pub fn tool_result(label: &str, result: &str) {
+    println!("{BOLD}{MAGENTA}tool>{RESET} {label}");
     render_markdown(result);
 }
 
