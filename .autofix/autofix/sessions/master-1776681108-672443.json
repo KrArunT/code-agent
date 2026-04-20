@@ -1,0 +1,14 @@
+{
+  "id": "master-1776681108-672443",
+  "title": null,
+  "resumed_from": null,
+  "workspace": "/home/arun/raw/coding-agent-rs",
+  "role": "master",
+  "command_history": [
+    "/search rust language",
+    "/exit"
+  ],
+  "messages": [],
+  "created_at": 1776681108,
+  "updated_at": 1776681109
+}

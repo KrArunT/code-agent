@@ -2624,6 +2624,8 @@ fn draw_tui(
 
         let title = Paragraph::new(vec![
             Line::from(vec![
+                Span::styled("agent", Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
                 Span::styled(
                     agent.config.banner_title.as_str(),
                     Style::default()
@@ -2637,32 +2639,22 @@ fn draw_tui(
                 ),
             ]),
             Line::from(vec![
-                Span::styled(
-                    format!("{:?}", agent.config.provider),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::raw(" / "),
-                Span::styled(
-                    agent.provider.model().to_string(),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw(" / "),
-                Span::styled(
+                badge(format!("{:?}", agent.config.provider), Color::Yellow),
+                Span::raw(" "),
+                badge(agent.provider.model().to_string(), Color::Green),
+                Span::raw(" "),
+                badge(
                     agent.config.access_label().to_string(),
-                    if agent.config.full_system_access {
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Blue)
-                    },
+                    access_color(agent.config.full_system_access),
                 ),
-                Span::raw(" / "),
-                Span::styled(
+                Span::raw(" "),
+                badge(
                     if agent.config.is_worker() {
                         "worker"
                     } else {
                         "master"
                     },
-                    Style::default().fg(Color::Magenta),
+                    Color::Magenta,
                 ),
             ]),
         ])
@@ -2670,40 +2662,61 @@ fn draw_tui(
         frame.render_widget(title, layout.top[0]);
 
         let status_panel = Paragraph::new(vec![
-            Line::from(format!("status: {status}")),
-            Line::from(format!(
-                "progress: {}",
-                if agent.progress.is_empty() {
-                    "idle"
-                } else {
-                    agent.progress.as_str()
-                }
-            )),
-            Line::from(format!(
-                "perm: shell={:?} write={:?}",
-                agent.tools.shell_permission(),
-                agent.tools.write_permission()
-            )),
-            Line::from(format!(
-                "access: {}",
-                if agent.tools.full_system_access() {
-                    "FULL SYSTEM"
-                } else {
-                    "workspace"
-                }
-            )),
-            Line::from(format!(
-                "role: {}",
-                if agent.config.is_worker() {
-                    "worker"
-                } else {
-                    "master"
-                }
-            )),
-            Line::from(format!(
-                "worker: {}",
-                agent.config.worker_id.as_deref().unwrap_or("none")
-            )),
+            Line::from(vec![
+                label("status", Color::DarkGray),
+                Span::raw(" "),
+                badge(status.to_string(), status_color(status)),
+            ]),
+            Line::from(vec![
+                label("progress", Color::DarkGray),
+                Span::raw(" "),
+                badge(
+                    if agent.progress.is_empty() {
+                        "idle".to_string()
+                    } else {
+                        agent.progress.clone()
+                    },
+                    Color::Blue,
+                ),
+            ]),
+            Line::from(vec![
+                label("perm", Color::DarkGray),
+                Span::raw(" "),
+                badge(
+                    format!("shell={:?}", agent.tools.shell_permission()),
+                    Color::Yellow,
+                ),
+                Span::raw(" "),
+                badge(
+                    format!("write={:?}", agent.tools.write_permission()),
+                    Color::Yellow,
+                ),
+            ]),
+            Line::from(vec![
+                label("access", Color::DarkGray),
+                Span::raw(" "),
+                badge(
+                    if agent.tools.full_system_access() {
+                        "FULL SYSTEM".to_string()
+                    } else {
+                        "workspace".to_string()
+                    },
+                    access_color(agent.tools.full_system_access()),
+                ),
+            ]),
+            Line::from(vec![
+                label("worker", Color::DarkGray),
+                Span::raw(" "),
+                badge(
+                    agent
+                        .config
+                        .worker_id
+                        .as_deref()
+                        .unwrap_or("none")
+                        .to_string(),
+                    Color::Magenta,
+                ),
+            ]),
         ])
         .block(Block::default().borders(Borders::ALL).title("state"));
         frame.render_widget(status_panel, layout.top[1]);
@@ -2876,16 +2889,29 @@ fn render_transcript_item(item: &TranscriptItem) -> Vec<Line<'static>> {
         _ => Style::default().add_modifier(Modifier::BOLD),
     };
 
-    let mut lines = vec![Line::from(vec![Span::styled(
-        format!("{}> ", item.role),
-        role_style,
-    )])];
-    lines.extend(render_markdown_lines(&item.content));
+    let role_name = if item.role == "assistant" {
+        "autofix"
+    } else {
+        item.role
+    };
+    let accent = match item.role {
+        "user" => Color::Green,
+        "assistant" => Color::Cyan,
+        "system" => Color::Yellow,
+        "error" => Color::Red,
+        _ => Color::DarkGray,
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("│ ", Style::default().fg(accent)),
+        Span::styled(format!(" {role_name} "), role_style),
+    ])];
+    lines.extend(render_markdown_lines(&item.content, accent));
     lines.push(Line::from(""));
     lines
 }
 
-fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
+fn render_markdown_lines(text: &str, accent: Color) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code = false;
     for raw in text.lines() {
@@ -2893,21 +2919,21 @@ fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
         if trimmed.starts_with("```") {
             in_code = !in_code;
             lines.push(Line::styled(
-                trimmed.to_string(),
+                format!("  {}", trimmed),
                 Style::default().fg(Color::DarkGray),
             ));
             continue;
         }
         if in_code {
             lines.push(Line::styled(
-                raw.to_string(),
+                format!("    {raw}"),
                 Style::default().fg(Color::LightBlue).bg(Color::Black),
             ));
             continue;
         }
         if let Some((level, heading)) = tui_heading(trimmed) {
             lines.push(Line::styled(
-                format!("{} {}", "#".repeat(level), heading),
+                format!("  {} {}", "#".repeat(level), heading),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -2917,16 +2943,19 @@ fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
             .or_else(|| trimmed.strip_prefix("* "))
         {
             lines.push(Line::from(vec![
-                Span::styled("  - ", Style::default().fg(Color::Yellow)),
+                Span::styled("  ├ ", Style::default().fg(accent)),
                 Span::raw(item.to_string()),
             ]));
         } else if trimmed.starts_with('>') {
             lines.push(Line::styled(
-                format!("| {}", trimmed.trim_start_matches('>').trim_start()),
+                format!("  │ {}", trimmed.trim_start_matches('>').trim_start()),
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
-            lines.push(Line::from(raw.to_string()));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(raw.to_string()),
+            ]));
         }
     }
     if lines.is_empty() {
@@ -2949,7 +2978,7 @@ fn tui_help_panel() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Commands"),
         Line::from("  /help /provider /models /use-model"),
-        Line::from("  /thinking /clear /exit"),
+        Line::from("  /thinking /search /clear /exit"),
         Line::from("  /worktree /worktree list /worktree auto /worktree add <path>"),
         Line::from("  /agents /agents spawn <name> | <task> /agents read <id>"),
         Line::from(""),
@@ -3010,6 +3039,41 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
         Some((level, &line[level + 1..]))
     } else {
         None
+    }
+}
+
+fn badge<T: Into<String>>(text: T, color: Color) -> Span<'static> {
+    let text = text.into();
+    Span::styled(
+        format!(" {text} "),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn label(text: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("{text}:"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn access_color(full_system: bool) -> Color {
+    if full_system {
+        Color::Red
+    } else {
+        Color::Blue
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "ready" => Color::Green,
+        "streaming" => Color::Cyan,
+        "thinking" => Color::Yellow,
+        "interrupted" => Color::Magenta,
+        "blocked" => Color::Red,
+        "complete" => Color::Green,
+        _ => Color::DarkGray,
     }
 }
 

@@ -53,7 +53,7 @@ pub fn banner(
 }
 
 pub fn assistant_start() -> io::Result<()> {
-    print!("{BOLD}{CYAN}assistant>{RESET} ");
+    print!("{BOLD}{CYAN}autofix>{RESET} ");
     io::stdout().flush()
 }
 
@@ -167,7 +167,7 @@ pub fn stream_thinking(delta: &str) -> io::Result<()> {
 }
 
 pub fn thinking_end() -> io::Result<()> {
-    print!("{RESET}\n{BOLD}{CYAN}answer>{RESET} ");
+    print!("{RESET}\n{BOLD}{CYAN}autofix>{RESET} ");
     io::stdout().flush()
 }
 
@@ -177,16 +177,16 @@ pub fn stream_reset() -> io::Result<()> {
 }
 
 pub fn tool_start(label: &str) {
-    println!("{BOLD}{MAGENTA}tool>{RESET} {label}");
+    println!("{BOLD}{MAGENTA}tool>{RESET} {BOLD}{MAGENTA}{label}{RESET}");
 }
 
 pub fn tool_result(label: &str, result: &str) {
-    println!("{BOLD}{MAGENTA}tool>{RESET} {label}");
+    println!("{BOLD}{MAGENTA}tool>{RESET} {BOLD}{MAGENTA}{label}{RESET}");
     render_markdown(result);
 }
 
 pub fn info(message: &str) {
-    println!("{BOLD}{YELLOW}info>{RESET} {message}");
+    println!("{BOLD}{BLUE}info>{RESET} {message}");
 }
 
 fn markdown_heading(line: &str) -> Option<(usize, &str)> {
@@ -260,7 +260,7 @@ pub fn error(message: &str) {
 }
 
 pub fn divider() {
-    println!("{DIM}------------------------------------------------------------{RESET}");
+    println!("{DIM}────────────────────────────────────────────────────────────{RESET}");
 }
 
 fn fit_banner_text(text: &str, max_chars: usize) -> String {

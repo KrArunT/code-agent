@@ -248,7 +248,12 @@ impl ToolRuntime {
         )
         .context("failed to build DuckDuckGo search URL")?;
 
-        let html = reqwest::Client::new()
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .context("failed to build DuckDuckGo HTTP client")?;
+
+        let html = client
             .get(url)
             .header(
                 reqwest::header::USER_AGENT,
