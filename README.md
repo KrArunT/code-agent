@@ -14,6 +14,7 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Configurable startup banner and onboarding help in both line mode and `--tui`.
 - Workspace tools for file listing, file reads, file writes, and shell execution.
 - Persistent memory notes and reusable skills loaded into the system prompt.
+- Persistent session command history and resumable task snapshots.
 - Git worktree management for multi-branch kernel work.
 - Automatic worktree creation for feature sessions.
 - Master/worker orchestration with isolated worker processes in separate worktrees.
@@ -52,6 +53,30 @@ The agent reads `autofix_config.json` from the current working directory when it
 The included [`autofix_config.json`](autofix_config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, the autonomy toggle, and `auto_worktree`.
 
 Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. The agent still stops at a finite safety cap, but the cap is much higher than the default interactive mode.
+
+## Session History
+
+Each run gets a persistent session record under the repo control directory. It stores the command history and a resumable message snapshot so you can pick up a task later.
+
+Use `/session` to inspect the active session:
+
+```text
+/session show
+/session list
+/session history
+/session save
+/session new
+/session resume <id>
+/history
+```
+
+To start a fresh process from a previous session, pass the session id back on the CLI:
+
+```bash
+cargo run -- --resume-session <session-id>
+```
+
+`/session resume <id>` also switches the live process to a new session cloned from the saved one, so you can continue immediately and keep the old record intact.
 
 ## Memory And Skills
 
@@ -293,6 +318,13 @@ Workspace commands:
 - `/write <path>` writes content until a line containing only `.`.
 - `/config` shows the current config file state.
 - `/config reload` reloads `autofix_config.json` from disk.
+- `/session` shows the active session state.
+- `/session list` lists saved sessions.
+- `/session history` shows the active command history.
+- `/session save` persists the active session record.
+- `/session new` starts a fresh session.
+- `/session resume <id>` resumes a saved session into a fresh current session.
+- `/history` shows the active command history.
 - `/memory` shows and edits persistent memory notes.
 - `/skills` shows and edits active skills.
 - `/worktree` shows and edits git worktree state.

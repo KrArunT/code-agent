@@ -2,6 +2,11 @@ use crate::{
     completion::{prompt_text, AgentCompleter},
     config::{list_ollama_models, AgentRole, Config, PermissionMode, ProviderKind, ThinkMode},
     provider::{Message, ProviderClient, Role, StreamEvent},
+    sessions::{
+        list_session_records, load_session_record, make_session_id, save_session_record,
+        session_history_summary, session_tail_summary, session_title_from_input, summarize_session,
+        SessionRecord,
+    },
     tools::{ToolCall, ToolRuntime},
     ui,
     workers::{
@@ -51,12 +56,14 @@ pub struct Agent {
     provider: ProviderClient,
     tools: ToolRuntime,
     messages: Vec<Message>,
+    session: SessionRecord,
     shell_mode: bool,
     prompt_attachments: Vec<PromptAttachment>,
     memory_store: MemoryStore,
     skills: Vec<LoadedSkill>,
     completion_workspace: Arc<Mutex<PathBuf>>,
     progress: String,
+    session_dirty: bool,
 }
 
 const MAX_TUI_HISTORY: usize = 400;
@@ -75,27 +82,32 @@ impl Agent {
         let memory_store = load_memory_store(&config.memory_file)?;
         let skills = load_skills(&config.skills_dir, config.active_skills())?;
         let system = build_system_prompt(&config, &memory_store, &skills);
-        let messages = vec![Message {
+        let session = initialize_session(&config)?;
+        let mut messages = vec![Message {
             role: Role::System,
             content: system,
         }];
+        messages.extend(session.messages.clone());
         Ok(Self {
             config,
             provider,
             tools,
             messages,
+            session,
             shell_mode: false,
             prompt_attachments: Vec::new(),
             memory_store,
             skills,
             completion_workspace: Arc::new(Mutex::new(completion_workspace)),
             progress: String::new(),
+            session_dirty: false,
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         self.ensure_auto_worktree().await?;
         self.update_plan_file("startup").await?;
+        self.persist_session_state()?;
         ui::banner(
             &self.config.banner_title,
             &self.config.banner_subtitle,
@@ -117,6 +129,7 @@ impl Agent {
             completer.set_workspace(workspace.clone());
         }
         editor.set_helper(Some(completer));
+        self.load_editor_history(&mut editor)?;
 
         loop {
             if let Some(helper) = editor.helper_mut() {
@@ -134,10 +147,15 @@ impl Agent {
             if input.trim().is_empty() {
                 continue;
             }
+            self.record_session_input(&input)?;
             let _ = editor.add_history_entry(input.as_str());
             if input.starts_with('/') || input.starts_with('!') {
                 if self.handle_command(&input).await? {
                     break;
+                }
+                if self.session_dirty {
+                    self.load_editor_history(&mut editor)?;
+                    self.session_dirty = false;
                 }
                 self.update_plan_file("command").await?;
                 continue;
@@ -150,12 +168,15 @@ impl Agent {
             if let Some(summary) = self.attachment_status_text() {
                 ui::info(&summary);
             }
+            self.update_session_title_from_prompt(&input);
             let user_prompt = self.compose_user_prompt(&input);
             self.messages.push(Message {
                 role: Role::User,
                 content: user_prompt,
             });
+            self.sync_session_messages()?;
             self.respond().await?;
+            self.sync_session_messages()?;
             self.update_plan_file("response").await?;
             self.clear_progress();
         }
@@ -208,12 +229,15 @@ impl Agent {
         );
 
         self.update_plan_file("startup").await?;
+        self.persist_session_state()?;
         self.messages.push(Message {
             role: Role::User,
             content: task,
         });
+        self.sync_session_messages()?;
 
         let result = self.respond().await;
+        self.sync_session_messages()?;
         let mut finished = load_worker_record(&self.config.workspace, &worker_id)?;
         finished.updated_at = now_epoch();
         match &result {
@@ -236,6 +260,7 @@ impl Agent {
     pub async fn run_tui(&mut self) -> Result<()> {
         self.ensure_auto_worktree().await?;
         self.update_plan_file("startup").await?;
+        self.persist_session_state()?;
         let mut terminal = TuiGuard::enter()?;
         let banner_onboarding = self.config.banner_onboarding();
         let mut transcript = vec![TranscriptItem::new(
@@ -247,7 +272,7 @@ impl Agent {
         let mut needs_draw = true;
         let mut show_help = false;
         let mut scroll_offset: usize = 0;
-        let mut input_history: Vec<String> = Vec::new();
+        let mut input_history: Vec<String> = self.session.command_history.clone();
         let mut history_index: Option<usize> = None;
 
         loop {
@@ -350,6 +375,7 @@ impl Agent {
                                 continue;
                             }
 
+                            self.record_session_input(&submitted)?;
                             input_history.push(submitted.clone());
                             if input_history.len() > 200 {
                                 let excess = input_history.len() - 200;
@@ -363,6 +389,19 @@ impl Agent {
                                 {
                                     break;
                                 }
+                                if self.session_dirty {
+                                    input_history = self.session.command_history.clone();
+                                    history_index = None;
+                                    transcript.clear();
+                                    transcript.push(TranscriptItem::new(
+                                        "system",
+                                        format!(
+                                            "session resumed: {}",
+                                            summarize_session(&self.session)
+                                        ),
+                                    ));
+                                    self.session_dirty = false;
+                                }
                                 self.update_plan_file("command").await?;
                                 needs_draw = true;
                                 continue;
@@ -373,11 +412,13 @@ impl Agent {
                                 transcript.push(TranscriptItem::new("system", summary));
                             }
                             trim_transcript(&mut transcript);
+                            self.update_session_title_from_prompt(&submitted);
                             let user_prompt = self.compose_user_prompt(&submitted);
                             self.messages.push(Message {
                                 role: Role::User,
                                 content: user_prompt,
                             });
+                            self.sync_session_messages()?;
 
                             status = "streaming".to_string();
                             transcript.push(TranscriptItem::new("assistant", String::new()));
@@ -433,6 +474,7 @@ impl Agent {
                                 role: Role::Assistant,
                                 content: answer,
                             });
+                            self.sync_session_messages()?;
                             status = "ready".to_string();
                             self.update_plan_file("response").await?;
                             self.clear_progress();
@@ -480,6 +522,14 @@ impl Agent {
                 ui::info(&self.handle_agents_command(arg).await?);
                 Ok(false)
             }
+            "/session" => {
+                ui::info(&self.handle_session_command(arg).await?);
+                Ok(false)
+            }
+            "/history" => {
+                ui::info(&session_history_summary(&self.session));
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     ui::info(&summary);
@@ -492,7 +542,7 @@ impl Agent {
             }
             "/provider" => {
                 ui::info(&format!(
-                    "role={:?} provider={:?} model={} base_url={} think={:?} show_thinking={} stops={} permissions=shell:{:?},write:{:?} access={}",
+                    "role={:?} provider={:?} model={} base_url={} think={:?} show_thinking={} stops={} permissions=shell:{:?},write:{:?} access={} session={}",
                     self.config.role,
                     self.config.provider,
                     self.provider.model(),
@@ -502,7 +552,8 @@ impl Agent {
                     format_stop_sequences(self.provider.stop_sequences()),
                     self.tools.shell_permission(),
                     self.tools.write_permission(),
-                    self.config.access_label()
+                    self.config.access_label(),
+                    self.session.id
                 ));
                 Ok(false)
             }
@@ -685,6 +736,20 @@ impl Agent {
                 ));
                 Ok(false)
             }
+            "/session" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_session_command(arg).await?,
+                ));
+                Ok(false)
+            }
+            "/history" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    session_history_summary(&self.session),
+                ));
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     transcript.push(TranscriptItem::new("system", summary));
@@ -695,7 +760,7 @@ impl Agent {
                 transcript.push(TranscriptItem::new(
                     "system",
                     format!(
-                        "role={:?}\nprovider={:?}\nmodel={}\nbase_url={}\nthink={:?}\npermissions=shell:{:?},write:{:?}\naccess={}",
+                        "role={:?}\nprovider={:?}\nmodel={}\nbase_url={}\nthink={:?}\npermissions=shell:{:?},write:{:?}\naccess={}\nsession={}",
                         self.config.role,
                         self.config.provider,
                         self.provider.model(),
@@ -703,7 +768,8 @@ impl Agent {
                         self.provider.think(),
                         self.tools.shell_permission(),
                         self.tools.write_permission(),
-                        self.config.access_label()
+                        self.config.access_label(),
+                        self.session.id
                     ),
                 ));
                 Ok(false)
@@ -889,7 +955,7 @@ impl Agent {
     async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
         match arg {
             "" | "show" => Ok(format!(
-                "config file: {}\nloaded: {}\nrole={:?}\nprovider={:?}\nmodel={}\nworkspace={}\ntask_file={}\nworker_id={}\nworker_name={}\nautonomous={}\nauto_worktree={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
+                "config file: {}\nloaded: {}\nrole={:?}\nprovider={:?}\nmodel={}\nworkspace={}\nsession_id={}\nresume_session={}\ntask_file={}\nworker_id={}\nworker_name={}\nautonomous={}\nauto_worktree={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
                 self.config.config_file.display(),
                 if self.config.config_file_exists() {
                     "yes"
@@ -900,6 +966,14 @@ impl Agent {
                 self.config.provider,
                 self.provider.model(),
                 self.config.workspace.display(),
+                self.config
+                    .session_id
+                    .as_deref()
+                    .unwrap_or(self.session.id.as_str()),
+                self.config
+                    .resume_session
+                    .as_deref()
+                    .unwrap_or("none"),
                 self.config
                     .task_file
                     .as_ref()
@@ -1117,6 +1191,48 @@ impl Agent {
         }
     }
 
+    async fn handle_session_command(&mut self, arg: &str) -> Result<String> {
+        let mut parts = arg.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+
+        match subcommand {
+            "" | "show" => Ok(session_tail_summary(&self.session)),
+            "list" => {
+                let records = list_session_records(&self.config.workspace)?;
+                if records.is_empty() {
+                    Ok("sessions: none".to_string())
+                } else {
+                    Ok(format!(
+                        "sessions:\n{}",
+                        records
+                            .iter()
+                            .map(summarize_session)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ))
+                }
+            }
+            "history" => Ok(session_history_summary(&self.session)),
+            "save" => {
+                self.persist_session_state()?;
+                Ok(format!("session saved: {}", self.session.id))
+            }
+            "new" => {
+                self.start_new_session()?;
+                Ok(format!("started new session: {}", self.session.id))
+            }
+            "resume" => {
+                let id = parts.next().unwrap_or_default();
+                if id.is_empty() {
+                    return Ok("usage: /session resume <id>".to_string());
+                }
+                self.resume_session(id)?;
+                Ok(format!("resumed session {} from {}", self.session.id, id))
+            }
+            _ => Ok("usage: /session [show|list|history|save|new|resume <id>]".to_string()),
+        }
+    }
+
     async fn ensure_auto_worktree(&mut self) -> Result<()> {
         if !self.config.auto_worktree {
             return Ok(());
@@ -1294,6 +1410,72 @@ impl Agent {
         Ok(())
     }
 
+    fn record_session_input(&mut self, input: &str) -> Result<()> {
+        self.session.command_history.push(input.to_string());
+        self.session.touch();
+        self.persist_session_state()
+    }
+
+    fn update_session_title_from_prompt(&mut self, input: &str) {
+        if self.session.title.is_none() && !input.trim().is_empty() {
+            self.session.title = Some(session_title_from_input(input));
+        }
+    }
+
+    fn sync_session_messages(&mut self) -> Result<()> {
+        self.session.messages = self.messages.iter().skip(1).cloned().collect();
+        self.session.touch();
+        self.persist_session_state()
+    }
+
+    fn persist_session_state(&mut self) -> Result<()> {
+        save_session_record(&self.config.workspace, &self.session)
+    }
+
+    fn load_editor_history(
+        &self,
+        editor: &mut Editor<AgentCompleter, DefaultHistory>,
+    ) -> Result<()> {
+        editor.clear_history()?;
+        for command in &self.session.command_history {
+            let _ = editor.add_history_entry(command.as_str());
+        }
+        Ok(())
+    }
+
+    fn start_new_session(&mut self) -> Result<()> {
+        self.session = SessionRecord::new(
+            self.config.workspace.clone(),
+            self.config.role,
+            make_session_id(self.config.role),
+        );
+        self.messages.truncate(1);
+        self.shell_mode = false;
+        self.prompt_attachments.clear();
+        self.clear_progress();
+        self.persist_session_state()?;
+        self.session_dirty = true;
+        Ok(())
+    }
+
+    fn resume_session(&mut self, id: &str) -> Result<()> {
+        let source = load_session_record(&self.config.workspace, id)?;
+        self.session = SessionRecord::resume_from(
+            &source,
+            self.config.workspace.clone(),
+            self.config.role,
+            make_session_id(self.config.role),
+        );
+        self.messages.truncate(1);
+        self.messages.extend(self.session.messages.clone());
+        self.shell_mode = false;
+        self.prompt_attachments.clear();
+        self.clear_progress();
+        self.persist_session_state()?;
+        self.session_dirty = true;
+        Ok(())
+    }
+
     fn switch_workspace(&mut self, new_workspace: PathBuf) -> Result<()> {
         let old_workspace = self.config.workspace.clone();
         if self.same_path(&old_workspace, &new_workspace) {
@@ -1310,6 +1492,9 @@ impl Agent {
         self.memory_store = load_memory_store(&self.config.memory_file)?;
         self.skills = load_skills(&self.config.skills_dir, self.config.active_skills())?;
         self.reload_context_layers()?;
+        self.session.workspace = self.config.workspace.clone();
+        self.session.touch();
+        self.persist_session_state()?;
         if let Ok(mut workspace) = self.completion_workspace.lock() {
             *workspace = self.config.workspace.clone();
         }
@@ -2093,6 +2278,29 @@ fn sync_workspace_context(old_workspace: &Path, new_workspace: &Path) -> Result<
     Ok(())
 }
 
+fn initialize_session(config: &Config) -> Result<SessionRecord> {
+    let session_id = config
+        .session_id
+        .clone()
+        .unwrap_or_else(|| make_session_id(config.role));
+
+    if let Some(source_id) = config.resume_session.as_deref() {
+        let source = load_session_record(&config.workspace, source_id)?;
+        return Ok(SessionRecord::resume_from(
+            &source,
+            config.workspace.clone(),
+            config.role,
+            session_id,
+        ));
+    }
+
+    Ok(SessionRecord::new(
+        config.workspace.clone(),
+        config.role,
+        session_id,
+    ))
+}
+
 fn copy_file_if_exists(old_workspace: &Path, new_workspace: &Path, name: &str) -> Result<()> {
     let source = old_workspace.join(name);
     if !source.exists() {
@@ -2693,7 +2901,7 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
@@ -2891,10 +3099,16 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 enum AgentDirective {
-    Final { summary: String },
-    Blocked { reason: String },
+    Final {
+        summary: String,
+    },
+    Blocked {
+        reason: String,
+    },
     #[serde(rename = "needs_worker")]
-    NeedsWorker { task: String },
+    NeedsWorker {
+        task: String,
+    },
 }
 
 fn extract_control_directive(text: &str) -> Result<Option<AgentDirective>> {

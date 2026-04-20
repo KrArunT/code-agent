@@ -2,6 +2,7 @@ mod agent;
 mod completion;
 mod config;
 mod provider;
+mod sessions;
 mod tools;
 mod ui;
 mod workers;

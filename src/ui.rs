@@ -326,6 +326,13 @@ pub fn help_text() -> &'static str {
   /agents            list isolated worker agents
   /agents spawn <name> | <task> spawn a worker in a fresh worktree
   /agents read <id>  show worker status and file paths
+  /session           show current session state
+  /session list      list saved sessions
+  /session history   show current command history
+  /session save      persist the current session record
+  /session new       start a fresh session
+  /session resume <id> resume a saved session into a fresh current session
+  /history           show current command history
   /provider          show provider configuration
   /permissions       show shell/write approval modes
   /permissions ask   ask before shell commands and file writes

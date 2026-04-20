@@ -12,6 +12,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::sessions::sessions_dir;
+
 const COMMANDS: &[&str] = &[
     "/chat",
     "/clear",
@@ -20,6 +22,7 @@ const COMMANDS: &[&str] = &[
     "/exit-shell",
     "/help",
     "/hide-thinking",
+    "/history",
     "/list",
     "/memory",
     "/models",
@@ -29,6 +32,7 @@ const COMMANDS: &[&str] = &[
     "/agents",
     "/attach",
     "/shell",
+    "/session",
     "/show-thinking",
     "/skills",
     "/stop",
@@ -125,6 +129,7 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
         }
         "/config" => complete_words(current_word(prefix).1, &["show", "reload"]),
         "/memory" => complete_words(current_word(prefix).1, &["show", "add", "clear", "reload"]),
+        "/session" => complete_session(prefix, workspace),
         "/skills" => {
             if parts.len() >= 3 && matches!(parts[1], "enable" | "disable") {
                 let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
@@ -149,6 +154,28 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
         "/worktree" => complete_worktree(prefix, workspace),
         "/agents" => complete_words(current_word(prefix).1, &["list", "spawn", "read"]),
         _ => (prefix.len(), Vec::new()),
+    }
+}
+
+fn complete_session(prefix: &str, workspace: &Path) -> (usize, Vec<Pair>) {
+    let parts = prefix.split_whitespace().collect::<Vec<_>>();
+    if parts.len() <= 1 && !prefix.ends_with(' ') {
+        return complete_words(
+            current_word(prefix).1,
+            &["show", "list", "history", "save", "new", "resume"],
+        );
+    }
+
+    match parts.get(1).copied().unwrap_or_default() {
+        "resume" => {
+            let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
+            let arg_prefix = &prefix[arg_start..];
+            (arg_start, session_pairs(workspace, arg_prefix))
+        }
+        _ => complete_words(
+            current_word(prefix).1,
+            &["show", "list", "history", "save", "new", "resume"],
+        ),
     }
 }
 
@@ -265,6 +292,36 @@ fn skill_pairs(workspace: &Path, raw_prefix: &str) -> Vec<Pair> {
             Some(Pair {
                 display: name.to_string(),
                 replacement: name.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    pairs.sort_by(|a, b| a.display.cmp(&b.display));
+    pairs
+}
+
+fn session_pairs(workspace: &Path, raw_prefix: &str) -> Vec<Pair> {
+    let Ok(dir) = sessions_dir(workspace) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut pairs = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+            if !stem.starts_with(raw_prefix) {
+                return None;
+            }
+            Some(Pair {
+                display: stem.to_string(),
+                replacement: stem.to_string(),
             })
         })
         .collect::<Vec<_>>();

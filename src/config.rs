@@ -74,6 +74,12 @@ pub struct Config {
     #[arg(long, env = "AGENT_WORKER_NAME")]
     pub worker_name: Option<String>,
 
+    #[arg(long, env = "AGENT_SESSION_ID")]
+    pub session_id: Option<String>,
+
+    #[arg(long, env = "AGENT_RESUME_SESSION")]
+    pub resume_session: Option<String>,
+
     #[arg(long, env = "AGENT_MEMORY_FILE", default_value = "memory.json")]
     pub memory_file: PathBuf,
 
@@ -157,6 +163,7 @@ pub struct ConfigFile {
     pub task_file: Option<PathBuf>,
     pub worker_id: Option<String>,
     pub worker_name: Option<String>,
+    pub session_id: Option<String>,
     pub memory_file: Option<PathBuf>,
     pub skills_dir: Option<PathBuf>,
     pub system: Option<String>,
@@ -250,6 +257,9 @@ impl Config {
         }
         if let Some(value) = file.worker_name {
             self.worker_name = Some(value);
+        }
+        if let Some(value) = file.session_id {
+            self.session_id = Some(value);
         }
         if let Some(value) = file.memory_file {
             self.memory_file = value;
@@ -406,6 +416,7 @@ impl Config {
             task_file: self.task_file.clone(),
             worker_id: self.worker_id.clone(),
             worker_name: self.worker_name.clone(),
+            session_id: None,
             memory_file: Some(self.memory_file.clone()),
             skills_dir: Some(self.skills_dir.clone()),
             system: self.system.clone(),
