@@ -23,6 +23,20 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 cargo build
 ```
 
+## Install
+
+One-line install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KrArunT/code-agent/main/install.sh | bash
+```
+
+The script uses `cargo install --git` under the hood. You can override the repository, branch, or install root with environment variables:
+
+```bash
+REPO_URL=https://github.com/KrArunT/code-agent.git BRANCH=main INSTALL_ROOT=$HOME/.local curl -fsSL https://raw.githubusercontent.com/KrArunT/code-agent/main/install.sh | bash
+```
+
 ## Quick Start
 
 Run with local Ollama and auto-pick a local model:
