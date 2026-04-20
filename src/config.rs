@@ -55,6 +55,12 @@ pub struct Config {
     #[arg(long, env = "AGENT_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,
 
+    #[arg(long, env = "AGENT_MEMORY_FILE", default_value = "memory.json")]
+    pub memory_file: PathBuf,
+
+    #[arg(long, env = "AGENT_SKILLS_DIR", default_value = "skills")]
+    pub skills_dir: PathBuf,
+
     #[arg(long, env = "AGENT_SYSTEM_PROMPT")]
     pub system: Option<String>,
 
@@ -87,6 +93,9 @@ pub struct Config {
 
     #[arg(long = "stop", env = "AGENT_STOP", value_delimiter = ',')]
     pub stop_sequences: Vec<String>,
+
+    #[arg(long = "skill", env = "AGENT_SKILL", value_delimiter = ',')]
+    pub active_skills: Vec<String>,
 
     #[arg(long, env = "AGENT_TUI")]
     pub tui: bool,
@@ -122,6 +131,8 @@ pub struct ConfigFile {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub workspace: Option<PathBuf>,
+    pub memory_file: Option<PathBuf>,
+    pub skills_dir: Option<PathBuf>,
     pub system: Option<String>,
     pub dangerously_allow_shell: Option<bool>,
     pub auto_write: Option<bool>,
@@ -133,6 +144,7 @@ pub struct ConfigFile {
     pub think: Option<ThinkMode>,
     pub hide_thinking: Option<bool>,
     pub stop_sequences: Option<Vec<String>>,
+    pub active_skills: Option<Vec<String>>,
     pub tui: Option<bool>,
     pub full_system_access: Option<bool>,
     pub banner_title: Option<String>,
@@ -194,6 +206,12 @@ impl Config {
         if let Some(value) = file.workspace {
             self.workspace = value;
         }
+        if let Some(value) = file.memory_file {
+            self.memory_file = value;
+        }
+        if let Some(value) = file.skills_dir {
+            self.skills_dir = value;
+        }
         if let Some(value) = file.system {
             self.system = Some(value);
         }
@@ -226,6 +244,9 @@ impl Config {
         }
         if let Some(value) = file.stop_sequences {
             self.stop_sequences = value;
+        }
+        if let Some(value) = file.active_skills {
+            self.active_skills = value;
         }
         if let Some(value) = file.tui {
             self.tui = value;
@@ -305,6 +326,60 @@ impl Config {
         }
     }
 
+    pub fn memory_file(&self) -> &PathBuf {
+        &self.memory_file
+    }
+
+    pub fn skills_dir(&self) -> &PathBuf {
+        &self.skills_dir
+    }
+
+    pub fn active_skills(&self) -> &[String] {
+        &self.active_skills
+    }
+
+    pub fn set_active_skills(&mut self, skills: Vec<String>) {
+        self.active_skills = skills;
+    }
+
+    pub fn snapshot_config_file(&self) -> ConfigFile {
+        ConfigFile {
+            provider: Some(self.provider),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            workspace: Some(self.workspace.clone()),
+            memory_file: Some(self.memory_file.clone()),
+            skills_dir: Some(self.skills_dir.clone()),
+            system: self.system.clone(),
+            dangerously_allow_shell: Some(self.dangerously_allow_shell),
+            auto_write: Some(self.auto_write),
+            approval_mode: Some(self.approval_mode),
+            shell_approval: self.shell_approval,
+            write_approval: self.write_approval,
+            max_tool_rounds: Some(self.max_tool_rounds),
+            autonomous: Some(self.autonomous),
+            think: Some(self.think),
+            hide_thinking: Some(self.hide_thinking),
+            stop_sequences: Some(self.stop_sequences.clone()),
+            active_skills: Some(self.active_skills.clone()),
+            tui: Some(self.tui),
+            full_system_access: Some(self.full_system_access),
+            banner_title: Some(self.banner_title.clone()),
+            banner_subtitle: Some(self.banner_subtitle.clone()),
+            banner_tip: Some(self.banner_tip.clone()),
+            banner_onboarding: Some(self.banner_onboarding.clone()),
+        }
+    }
+
+    pub fn resolve_workspace_path(&self, path: &PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            self.workspace.join(path)
+        }
+    }
+
     async fn finish_resolve(mut self) -> Result<Self> {
         self.workspace = self.workspace.canonicalize().map_err(|err| {
             anyhow!(
@@ -312,6 +387,8 @@ impl Config {
                 self.workspace.display()
             )
         })?;
+        self.memory_file = self.resolve_workspace_path(&self.memory_file);
+        self.skills_dir = self.resolve_workspace_path(&self.skills_dir);
 
         if self.api_key.is_none() {
             self.api_key = match self.provider {

@@ -12,6 +12,7 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Optional `ratatui` full-screen mode behind `--tui` with help overlay, scrollback, and input history.
 - Configurable startup banner and onboarding help in both line mode and `--tui`.
 - Workspace tools for file listing, file reads, file writes, and shell execution.
+- Persistent memory notes and reusable skills loaded into the system prompt.
 - Approval modes for shell commands and writes: `ask`, `allow`, or `deny`.
 - Full system access mode for trusted sessions with absolute paths, workspace escapes, shell, and writes enabled.
 - Shell runner mode plus full terminal passthrough mode.
@@ -46,6 +47,38 @@ The agent reads `config.json` from the current working directory when it starts,
 The included [`config.json`](config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, and the autonomy toggle.
 
 Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. The agent still stops at a finite safety cap, but the cap is much higher than the default interactive mode.
+
+## Memory And Skills
+
+The agent loads `memory.json` and the `skills/` directory from the workspace on startup. These are merged into the system prompt so repeated context can stay out of the chat transcript.
+
+The sample files in the repo are:
+
+- [`memory.json`](memory.json) for persistent notes.
+- [`skills/context-management.md`](skills/context-management.md) for context hygiene.
+- [`skills/kernel-backporting.md`](skills/kernel-backporting.md) for backport-specific instructions.
+- [`skills/plan-mode.md`](skills/plan-mode.md) for short, explicit decomposition before execution.
+
+Use `/memory` to inspect or update the memory file during a session:
+
+```text
+/memory show
+/memory add keep context small
+/memory clear
+/memory reload
+```
+
+Use `/skills` to inspect or switch active skills:
+
+```text
+/skills show
+/skills list
+/skills enable context-management
+/skills disable kernel-backporting
+/skills reload
+```
+
+The active skill list is stored in `config.json` under `active_skills`, and `/config reload` re-reads `config.json`, `memory.json`, and the active skills without restarting the agent.
 
 ## Quick Start
 
@@ -200,6 +233,8 @@ Workspace commands:
 - `/write <path>` writes content until a line containing only `.`.
 - `/config` shows the current config file state.
 - `/config reload` reloads `config.json` from disk.
+- `/memory` shows and edits persistent memory notes.
+- `/skills` shows and edits active skills.
 - `/attach file <path>` queues a file to prepend to the next prompt.
 - `/attach image <path>` queues an image reference and metadata to prepend to the next prompt.
 - `/attach show` shows queued prompt attachments.

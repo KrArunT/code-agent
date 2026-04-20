@@ -1,0 +1,6 @@
+{
+  "notes": [
+    "Keep the working set small and prefer focused patches.",
+    "Reload config, memory, and skills when the session context changes."
+  ]
+}

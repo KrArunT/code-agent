@@ -14,12 +14,13 @@ use std::{
 const COMMANDS: &[&str] = &[
     "/chat",
     "/clear",
+    "/config",
     "/exit",
     "/exit-shell",
     "/help",
-    "/config",
     "/hide-thinking",
     "/list",
+    "/memory",
     "/models",
     "/permissions",
     "/provider",
@@ -27,6 +28,7 @@ const COMMANDS: &[&str] = &[
     "/attach",
     "/shell",
     "/show-thinking",
+    "/skills",
     "/stop",
     "/terminal",
     "/thinking",
@@ -106,6 +108,19 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
             }
         }
         "/config" => complete_words(current_word(prefix).1, &["show", "reload"]),
+        "/memory" => complete_words(current_word(prefix).1, &["show", "add", "clear", "reload"]),
+        "/skills" => {
+            if parts.len() >= 3 && matches!(parts[1], "enable" | "disable") {
+                let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
+                let arg_prefix = &prefix[arg_start..];
+                (arg_start, skill_pairs(workspace, arg_prefix))
+            } else {
+                complete_words(
+                    current_word(prefix).1,
+                    &["show", "list", "reload", "enable", "disable"],
+                )
+            }
+        }
         "/permissions" => complete_words(
             current_word(prefix).1,
             &["ask", "allow", "deny", "shell", "write"],
@@ -182,10 +197,34 @@ fn path_pairs(workspace: &Path, raw_prefix: &str) -> Vec<Pair> {
             if entry.file_type().ok()?.is_dir() {
                 replacement.push('/');
             }
-            let display = replacement.clone();
             Some(Pair {
-                display,
+                display: replacement.clone(),
                 replacement,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    pairs.sort_by(|a, b| a.display.cmp(&b.display));
+    pairs
+}
+
+fn skill_pairs(workspace: &Path, raw_prefix: &str) -> Vec<Pair> {
+    let skills_dir = workspace.join("skills");
+    let Ok(entries) = fs::read_dir(&skills_dir) else {
+        return Vec::new();
+    };
+
+    let mut pairs = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_stem().and_then(|name| name.to_str())?;
+            if !name.starts_with(raw_prefix) {
+                return None;
+            }
+            Some(Pair {
+                display: name.to_string(),
+                replacement: name.to_string(),
             })
         })
         .collect::<Vec<_>>();

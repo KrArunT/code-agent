@@ -303,6 +303,15 @@ pub fn help_text() -> &'static str {
   /help              show this help
   /config            show current config file state
   /config reload     reload config.json from disk
+  /memory            show memory notes
+  /memory add <text> add a durable memory note
+  /memory clear      clear all memory notes
+  /memory reload     reload memory.json from disk
+  /skills            show active skills
+  /skills list       list available skills on disk
+  /skills reload     reload active skill files
+  /skills enable <name> add a skill to the active set
+  /skills disable <name> remove a skill from the active set
   /provider          show provider configuration
   /permissions       show shell/write approval modes
   /permissions ask   ask before shell commands and file writes

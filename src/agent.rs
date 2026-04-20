@@ -30,9 +30,11 @@ use rustyline::{
     history::DefaultHistory,
     Config as RustylineConfig, Editor,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::{self, Stdout},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -44,6 +46,8 @@ pub struct Agent {
     messages: Vec<Message>,
     shell_mode: bool,
     prompt_attachments: Vec<PromptAttachment>,
+    memory_store: MemoryStore,
+    skills: Vec<LoadedSkill>,
 }
 
 const MAX_TUI_HISTORY: usize = 400;
@@ -57,7 +61,9 @@ impl Agent {
             config.write_permission(),
             config.full_system_access,
         );
-        let system = config.system.clone().unwrap_or_else(default_system_prompt);
+        let memory_store = load_memory_store(&config.memory_file)?;
+        let skills = load_skills(&config.skills_dir, config.active_skills())?;
+        let system = build_system_prompt(&config, &memory_store, &skills);
         let messages = vec![Message {
             role: Role::System,
             content: system,
@@ -69,6 +75,8 @@ impl Agent {
             messages,
             shell_mode: false,
             prompt_attachments: Vec::new(),
+            memory_store,
+            skills,
         })
     }
 
@@ -362,6 +370,14 @@ impl Agent {
                 ui::info(&self.handle_config_command(arg).await?);
                 Ok(false)
             }
+            "/memory" => {
+                ui::info(&self.handle_memory_command(arg).await?);
+                Ok(false)
+            }
+            "/skills" => {
+                ui::info(&self.handle_skills_command(arg).await?);
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     ui::info(&summary);
@@ -535,6 +551,20 @@ impl Agent {
                 transcript.push(TranscriptItem::new(
                     "system",
                     self.handle_config_command(arg).await?,
+                ));
+                Ok(false)
+            }
+            "/memory" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_memory_command(arg).await?,
+                ));
+                Ok(false)
+            }
+            "/skills" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_skills_command(arg).await?,
                 ));
                 Ok(false)
             }
@@ -740,7 +770,7 @@ impl Agent {
     async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
         match arg {
             "" | "show" => Ok(format!(
-                "config file: {}\nloaded: {}\nprovider={:?}\nmodel={}\nworkspace={}\nautonomous={}\nmax_tool_rounds={}",
+                "config file: {}\nloaded: {}\nprovider={:?}\nmodel={}\nworkspace={}\nautonomous={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
                 self.config.config_file.display(),
                 if self.config.config_file_exists() {
                     "yes"
@@ -751,7 +781,10 @@ impl Agent {
                 self.provider.model(),
                 self.config.workspace.display(),
                 self.config.autonomous,
-                self.config.effective_max_tool_rounds()
+                self.config.effective_max_tool_rounds(),
+                self.config.memory_file().display(),
+                self.config.skills_dir().display(),
+                self.config.active_skills().join(", ")
             )),
             "reload" => {
                 self.reload_from_config_file().await?;
@@ -766,6 +799,96 @@ impl Agent {
 
     async fn reload_from_config_file(&mut self) -> Result<()> {
         self.config.reload_from_disk().await?;
+        self.memory_store = load_memory_store(self.config.memory_file())?;
+        self.skills = load_skills(self.config.skills_dir(), self.config.active_skills())?;
+        self.reload_context_layers()
+    }
+
+    async fn handle_memory_command(&mut self, arg: &str) -> Result<String> {
+        let arg = arg.trim();
+        match arg {
+            "" | "show" => Ok(self.memory_summary()),
+            "clear" => {
+                self.memory_store.notes.clear();
+                save_memory_store(self.config.memory_file(), &self.memory_store)?;
+                self.reload_context_layers()?;
+                Ok("memory cleared".to_string())
+            }
+            "reload" => {
+                self.memory_store = load_memory_store(self.config.memory_file())?;
+                self.reload_context_layers()?;
+                Ok(format!(
+                    "reloaded memory from {}",
+                    self.config.memory_file().display()
+                ))
+            }
+            _ if arg.starts_with("add ") => {
+                let note = arg[4..].trim();
+                if note.is_empty() {
+                    return Ok("usage: /memory add <text>".to_string());
+                }
+                self.memory_store.notes.push(note.to_string());
+                save_memory_store(self.config.memory_file(), &self.memory_store)?;
+                self.reload_context_layers()?;
+                Ok(format!("added memory note: {note}"))
+            }
+            _ => Ok("usage: /memory [show|add <text>|clear|reload]".to_string()),
+        }
+    }
+
+    async fn handle_skills_command(&mut self, arg: &str) -> Result<String> {
+        let arg = arg.trim();
+        match arg {
+            "" | "show" => Ok(self.skills_summary()),
+            "list" => Ok(self.available_skills_summary()),
+            "reload" => {
+                self.skills = load_skills(self.config.skills_dir(), self.config.active_skills())?;
+                self.reload_context_layers()?;
+                Ok(format!(
+                    "reloaded skills from {}",
+                    self.config.skills_dir().display()
+                ))
+            }
+            _ if arg.starts_with("enable ") => {
+                let name = arg[7..].trim();
+                if name.is_empty() {
+                    return Ok("usage: /skills enable <name>".to_string());
+                }
+                if !self
+                    .config
+                    .active_skills()
+                    .iter()
+                    .any(|skill| skill == name)
+                {
+                    let mut active = self.config.active_skills().to_vec();
+                    active.push(name.to_string());
+                    self.config.set_active_skills(active);
+                    self.persist_config_file()?;
+                    self.skills =
+                        load_skills(self.config.skills_dir(), self.config.active_skills())?;
+                    self.reload_context_layers()?;
+                }
+                Ok(format!("enabled skill: {name}"))
+            }
+            _ if arg.starts_with("disable ") => {
+                let name = arg[8..].trim();
+                if name.is_empty() {
+                    return Ok("usage: /skills disable <name>".to_string());
+                }
+                let mut active = self.config.active_skills().to_vec();
+                active.retain(|skill| skill != name);
+                self.config.set_active_skills(active);
+                self.persist_config_file()?;
+                self.skills = load_skills(self.config.skills_dir(), self.config.active_skills())?;
+                self.reload_context_layers()?;
+                Ok(format!("disabled skill: {name}"))
+            }
+            _ => Ok("usage: /skills [show|list|reload|enable <name>|disable <name>]".to_string()),
+        }
+    }
+
+    fn reload_context_layers(&mut self) -> Result<()> {
+        let system = build_system_prompt(&self.config, &self.memory_store, &self.skills);
         self.provider = ProviderClient::new(&self.config);
         self.tools = ToolRuntime::new(
             self.config.workspace.clone(),
@@ -773,11 +896,6 @@ impl Agent {
             self.config.write_permission(),
             self.config.full_system_access,
         );
-        let system = self
-            .config
-            .system
-            .clone()
-            .unwrap_or_else(default_system_prompt);
         if let Some(first) = self.messages.first_mut() {
             first.role = Role::System;
             first.content = system;
@@ -791,6 +909,74 @@ impl Agent {
             );
         }
         Ok(())
+    }
+
+    fn persist_config_file(&self) -> Result<()> {
+        let file = self.config.snapshot_config_file();
+        let text = serde_json::to_string_pretty(&file).context("failed to serialize config")?;
+        fs::write(&self.config.config_file, text).with_context(|| {
+            format!(
+                "failed to write config file {}",
+                self.config.config_file.display()
+            )
+        })
+    }
+
+    fn memory_summary(&self) -> String {
+        if self.memory_store.notes.is_empty() {
+            "memory: none".to_string()
+        } else {
+            format!(
+                "memory notes:\n{}",
+                self.memory_store
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, note)| format!("{}: {}", idx + 1, note))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    }
+
+    fn skills_summary(&self) -> String {
+        if self.skills.is_empty() {
+            return "skills: none active".to_string();
+        }
+
+        let active = self
+            .skills
+            .iter()
+            .map(|skill| format!("{} ({})", skill.name, skill.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("active skills:\n{active}")
+    }
+
+    fn available_skills_summary(&self) -> String {
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.config.skills_dir()) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path.is_file()
+                    && (path.extension().and_then(|ext| ext.to_str()) == Some("md")
+                        || path.extension().and_then(|ext| ext.to_str()) == Some("txt"))
+                {
+                    names.push(name.to_string());
+                } else if path.is_dir() && path.join("SKILL.md").exists() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        if names.is_empty() {
+            "available skills: none found".to_string()
+        } else {
+            format!("available skills:\n{}", names.join("\n"))
+        }
     }
 
     fn compose_user_prompt(&mut self, input: &str) -> String {
@@ -1106,6 +1292,18 @@ impl PromptAttachment {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MemoryStore {
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedSkill {
+    name: String,
+    path: PathBuf,
+    content: String,
+}
+
 fn compose_prompt_with_attachments(input: &str, attachments: &[PromptAttachment]) -> String {
     if attachments.is_empty() {
         return input.to_string();
@@ -1128,6 +1326,83 @@ fn compose_prompt_with_attachments(input: &str, attachments: &[PromptAttachment]
     }
     output.push_str(input);
     output
+}
+
+fn load_memory_store(path: &Path) -> Result<MemoryStore> {
+    if !path.exists() {
+        return Ok(MemoryStore::default());
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read memory file {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse memory file {}", path.display()))
+}
+
+fn save_memory_store(path: &Path, store: &MemoryStore) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(store).context("failed to serialize memory store")?;
+    fs::write(path, text).with_context(|| format!("failed to write memory file {}", path.display()))
+}
+
+fn load_skills(dir: &Path, active_skills: &[String]) -> Result<Vec<LoadedSkill>> {
+    let mut loaded = Vec::new();
+    for name in active_skills {
+        if let Some(skill) = load_skill(dir, name)? {
+            loaded.push(skill);
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_skill(dir: &Path, name: &str) -> Result<Option<LoadedSkill>> {
+    let candidates = [
+        dir.join(format!("{name}.md")),
+        dir.join(format!("{name}.txt")),
+        dir.join(name).join("SKILL.md"),
+    ];
+    for path in candidates {
+        if path.exists() {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read skill {}", path.display()))?;
+            return Ok(Some(LoadedSkill {
+                name: name.to_string(),
+                path,
+                content,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn build_system_prompt(config: &Config, memory: &MemoryStore, skills: &[LoadedSkill]) -> String {
+    let mut sections = Vec::new();
+    sections.push(config.system.clone().unwrap_or_else(default_system_prompt));
+
+    if !memory.notes.is_empty() {
+        sections.push(format!(
+            "Persistent memory:\n{}",
+            memory
+                .notes
+                .iter()
+                .map(|note| format!("- {note}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if !skills.is_empty() {
+        let rendered = skills
+            .iter()
+            .map(|skill| format!("Skill: {}\n{}", skill.name, skill.content.trim()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        sections.push(rendered);
+    }
+
+    sections.join("\n\n")
 }
 
 fn draw_tui(
