@@ -2889,10 +2889,11 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(tag = "state", rename_all = "lowercase")]
 enum AgentDirective {
     Final { summary: String },
     Blocked { reason: String },
+    #[serde(rename = "needs_worker")]
     NeedsWorker { task: String },
 }
 
@@ -2913,6 +2914,78 @@ fn extract_control_directive(text: &str) -> Result<Option<AgentDirective>> {
     let directive = serde_json::from_value::<AgentDirective>(value)
         .with_context(|| format!("failed to parse control directive: {json_text}"))?;
     Ok(Some(directive))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_batched_tool_blocks() {
+        let text = r#"
+Here is the work.
+```json
+{"tool":"read_file","path":"src/main.rs"}
+```
+```json
+{"tool":"list_files","path":"src"}
+```
+"#;
+
+        let calls = extract_tool_calls(text).expect("tool blocks should parse");
+        assert_eq!(calls.len(), 2);
+        match &calls[0] {
+            ToolCall::ReadFile { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("unexpected first call: {other:?}"),
+        }
+        match &calls[1] {
+            ToolCall::ListFiles { path } => assert_eq!(path.as_deref(), Some("src")),
+            other => panic!("unexpected second call: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_control_directives() {
+        let final_block = r#"
+```json
+{"state":"final","summary":"done"}
+```
+"#;
+        let blocked_block = r#"
+```json
+{"state":"blocked","reason":"missing context"}
+```
+"#;
+        let worker_block = r#"
+```json
+{"state":"needs_worker","task":"isolate parser work"}
+```
+"#;
+
+        match extract_control_directive(final_block)
+            .expect("final directive should parse")
+            .expect("directive should exist")
+        {
+            AgentDirective::Final { summary } => assert_eq!(summary, "done"),
+            other => panic!("unexpected directive: {other:?}"),
+        }
+
+        match extract_control_directive(blocked_block)
+            .expect("blocked directive should parse")
+            .expect("directive should exist")
+        {
+            AgentDirective::Blocked { reason } => assert_eq!(reason, "missing context"),
+            other => panic!("unexpected directive: {other:?}"),
+        }
+
+        match extract_control_directive(worker_block)
+            .expect("worker directive should parse")
+            .expect("directive should exist")
+        {
+            AgentDirective::NeedsWorker { task } => assert_eq!(task, "isolate parser work"),
+            other => panic!("unexpected directive: {other:?}"),
+        }
+    }
 }
 
 fn default_system_prompt() -> String {
