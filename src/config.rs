@@ -31,7 +31,7 @@ pub enum PermissionMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "coding-agent-rs")]
+#[command(name = "autofix")]
 #[command(about = "Interactive coding agent with multi-provider support")]
 pub struct Config {
     #[arg(long, value_enum, env = "AGENT_PROVIDER", default_value = "ollama")]

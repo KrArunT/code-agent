@@ -47,6 +47,6 @@ cargo install \
     --root "$INSTALL_ROOT"
 
 echo
-echo "Installed to: ${INSTALL_ROOT}/bin/coding-agent-rs"
+echo "Installed to: ${INSTALL_ROOT}/bin/autofix"
 echo "If needed, add this to your PATH:"
 echo "  export PATH=\"${INSTALL_ROOT}/bin:\$PATH\""

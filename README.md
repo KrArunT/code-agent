@@ -37,6 +37,8 @@ The script bootstraps Rust with `rustup` if `cargo` is missing, then uses `cargo
 REPO_URL=https://github.com/KrArunT/code-agent.git BRANCH=main INSTALL_ROOT=$HOME/.local curl -fsSL https://raw.githubusercontent.com/KrArunT/code-agent/main/install.sh | bash
 ```
 
+The installed binary is named `autofix`.
+
 ## Quick Start
 
 Run with local Ollama and auto-pick a local model:
