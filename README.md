@@ -13,6 +13,10 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Configurable startup banner and onboarding help in both line mode and `--tui`.
 - Workspace tools for file listing, file reads, file writes, and shell execution.
 - Persistent memory notes and reusable skills loaded into the system prompt.
+- Git worktree management for multi-branch kernel work.
+- Automatic worktree creation for feature sessions.
+- Master/worker orchestration with isolated worker processes in separate worktrees.
+- Workspace instructions in `AGENT.md` and live session state in `PLAN.md`.
 - Approval modes for shell commands and writes: `ask`, `allow`, or `deny`.
 - Full system access mode for trusted sessions with absolute paths, workspace escapes, shell, and writes enabled.
 - Shell runner mode plus full terminal passthrough mode.
@@ -42,15 +46,16 @@ The installed binary is named `autofix`.
 
 ## Config
 
-The agent reads `config.json` from the current working directory when it starts, if the file exists. You can reload the same file during a session with `/config reload`.
+The agent reads `autofix_config.json` from the current working directory when it starts, if the file exists. You can reload the same file during a session with `/config reload`.
 
-The included [`config.json`](config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, and the autonomy toggle.
+The included [`autofix_config.json`](autofix_config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, the autonomy toggle, and `auto_worktree`.
 
 Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. The agent still stops at a finite safety cap, but the cap is much higher than the default interactive mode.
 
 ## Memory And Skills
 
 The agent loads `memory.json` and the `skills/` directory from the workspace on startup. These are merged into the system prompt so repeated context can stay out of the chat transcript.
+It also auto-initializes `AGENT.md` from `AGENTS.md` if needed, reads `AGENT.md` and `PLAN.md` from the workspace root, and rewrites `PLAN.md` as the session changes.
 
 The sample files in the repo are:
 
@@ -78,7 +83,53 @@ Use `/skills` to inspect or switch active skills:
 /skills reload
 ```
 
-The active skill list is stored in `config.json` under `active_skills`, and `/config reload` re-reads `config.json`, `memory.json`, and the active skills without restarting the agent.
+The active skill list is stored in `autofix_config.json` under `active_skills`, and `/config reload` re-reads `autofix_config.json`, `memory.json`, and the active skills without restarting the agent.
+
+## Worktrees
+
+When `auto_worktree` is enabled, `autofix` creates a fresh git worktree on startup if the session begins at the repository root. That keeps feature work isolated from the original tree.
+
+Use `/worktree` to inspect or change the active git worktree:
+
+```text
+/worktree auto
+/worktree status
+/worktree list
+/worktree add ../worktrees/backport-fix backport-fix
+/worktree switch ../worktrees/backport-fix
+/worktree remove ../worktrees/backport-fix
+/worktree prune
+```
+
+`/worktree auto` checks or creates the default isolated worktree for the current repo. `/worktree add` creates a new worktree, switches the agent to it, reloads workspace memory and skills when they live under the workspace, and saves the updated workspace back to `autofix_config.json`.
+
+## Workers
+
+The master agent can delegate isolated subproblems to worker agents.
+
+Workers run as separate `autofix` processes in their own git worktrees, each with its own copied context files:
+
+- `AGENT.md`
+- `PLAN.md`
+- `memory.json`
+- `skills/`
+- `autofix_config.json`
+
+Use the agent command surface to manage them:
+
+```text
+/agents
+/agents spawn parser-fix | isolate the parser logic and patch the failing branch
+/agents read <id>
+```
+
+Workers are hard-isolated from the master session at the filesystem level. They do not share the same workspace path, and the master keeps control through the shared worker registry under the repository’s git common directory.
+
+If you launch a worker manually, use:
+
+```bash
+autofix --role worker --config-file /path/to/worktree/autofix_config.json --task-file /path/to/task.md --worker-id worker-123
+```
 
 ## Quick Start
 
@@ -110,6 +161,14 @@ Use stricter permissions:
 
 ```bash
 cargo run -- --approval-mode ask --shell-approval deny --write-approval ask
+```
+
+Spawn a worker directly:
+
+```bash
+autofix
+# then in the agent UI:
+/agents spawn backport-fix | isolate the backport into its own worktree
 ```
 
 Run with full system access for a trusted local session:
@@ -232,9 +291,10 @@ Workspace commands:
 - `/read <path>` prints a file.
 - `/write <path>` writes content until a line containing only `.`.
 - `/config` shows the current config file state.
-- `/config reload` reloads `config.json` from disk.
+- `/config reload` reloads `autofix_config.json` from disk.
 - `/memory` shows and edits persistent memory notes.
 - `/skills` shows and edits active skills.
+- `/worktree` shows and edits git worktree state.
 - `/attach file <path>` queues a file to prepend to the next prompt.
 - `/attach image <path>` queues an image reference and metadata to prepend to the next prompt.
 - `/attach show` shows queued prompt attachments.

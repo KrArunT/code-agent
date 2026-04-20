@@ -4,6 +4,7 @@ mod config;
 mod provider;
 mod tools;
 mod ui;
+mod workers;
 
 use agent::Agent;
 use anyhow::Result;
@@ -14,6 +15,9 @@ use config::Config;
 async fn main() -> Result<()> {
     let config = Config::parse().resolve().await?;
     let mut agent = Agent::new(config)?;
+    if agent.is_worker_mode() {
+        return agent.run_worker().await;
+    }
     if agent.is_tui_enabled() {
         agent.run_tui().await
     } else {

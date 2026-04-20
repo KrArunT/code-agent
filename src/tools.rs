@@ -17,6 +17,9 @@ pub enum ToolCall {
     ReadFile { path: String },
     WriteFile { path: String, content: String },
     RunShell { command: String },
+    SpawnWorker { name: Option<String>, task: String },
+    ListWorkers,
+    ReadWorker { id: String },
 }
 
 pub struct ToolRuntime {
@@ -67,6 +70,11 @@ impl ToolRuntime {
             ToolCall::ReadFile { path } => self.read_file(&path),
             ToolCall::WriteFile { path, content } => self.write_file(&path, &content),
             ToolCall::RunShell { command } => self.run_shell(&command).await,
+            ToolCall::SpawnWorker { .. } | ToolCall::ListWorkers | ToolCall::ReadWorker { .. } => {
+                Err(anyhow!(
+                    "agent orchestration tools must be handled by the master agent"
+                ))
+            }
         }
     }
 
@@ -138,6 +146,42 @@ impl ToolRuntime {
             .output()
             .await
             .with_context(|| format!("failed to run `{command}`"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, stdout, stderr
+        ))
+    }
+
+    pub async fn run_git(&self, args: &[&str]) -> Result<String> {
+        let command = format!("git {}", args.join(" "));
+        match approve(
+            self.shell_permission,
+            &format!("run git command `{command}`?"),
+        )? {
+            Approval::Approved => {}
+            Approval::Cancelled => return Ok("git command cancelled by user".to_string()),
+            Approval::Denied => return Ok("git command denied by permission mode".to_string()),
+        }
+
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.workspace)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("failed to run `{command}`"))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

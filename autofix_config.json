@@ -8,6 +8,7 @@
     "kernel-backporting",
     "plan-mode"
   ],
+  "auto_worktree": true,
   "autonomous": true,
   "max_tool_rounds": 50,
   "system": "You are an autonomous Linux kernel backporting agent running inside a local workspace.",

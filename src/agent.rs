@@ -1,11 +1,16 @@
 use crate::{
     completion::{prompt_text, AgentCompleter},
-    config::{list_ollama_models, Config, PermissionMode, ProviderKind, ThinkMode},
+    config::{list_ollama_models, AgentRole, Config, PermissionMode, ProviderKind, ThinkMode},
     provider::{Message, ProviderClient, Role, StreamEvent},
     tools::{ToolCall, ToolRuntime},
     ui,
+    workers::{
+        list_worker_records, load_worker_record, make_worker_id, now_epoch,
+        registry_root_for_workspace, save_worker_record, summarize_worker, task_excerpt,
+        worker_log_path, worker_tail_summary, worker_task_path, WorkerRecord, WorkerStatus,
+    },
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -33,10 +38,12 @@ use rustyline::{
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    fs::OpenOptions,
     io::{self, Stdout},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub struct Agent {
@@ -48,12 +55,15 @@ pub struct Agent {
     prompt_attachments: Vec<PromptAttachment>,
     memory_store: MemoryStore,
     skills: Vec<LoadedSkill>,
+    completion_workspace: Arc<Mutex<PathBuf>>,
 }
 
 const MAX_TUI_HISTORY: usize = 400;
 
 impl Agent {
     pub fn new(config: Config) -> Result<Self> {
+        let completion_workspace = config.workspace.clone();
+        ensure_agent_doc(&config.workspace)?;
         let provider = ProviderClient::new(&config);
         let tools = ToolRuntime::new(
             config.workspace.clone(),
@@ -77,10 +87,13 @@ impl Agent {
             prompt_attachments: Vec::new(),
             memory_store,
             skills,
+            completion_workspace: Arc::new(Mutex::new(completion_workspace)),
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        self.ensure_auto_worktree().await?;
+        self.update_plan_file("startup").await?;
         ui::banner(
             &self.config.banner_title,
             &self.config.banner_subtitle,
@@ -97,7 +110,11 @@ impl Agent {
             .edit_mode(EditMode::Emacs)
             .build();
         let mut editor = Editor::<AgentCompleter, DefaultHistory>::with_config(editor_config)?;
-        editor.set_helper(Some(AgentCompleter::new(self.config.workspace.clone())));
+        let mut completer = AgentCompleter::new(self.config.workspace.clone());
+        if let Ok(workspace) = self.completion_workspace.lock() {
+            completer.set_workspace(workspace.clone());
+        }
+        editor.set_helper(Some(completer));
 
         loop {
             if let Some(helper) = editor.helper_mut() {
@@ -120,6 +137,7 @@ impl Agent {
                 if self.handle_command(&input).await? {
                     break;
                 }
+                self.update_plan_file("command").await?;
                 continue;
             }
             if self.shell_mode {
@@ -136,6 +154,7 @@ impl Agent {
                 content: user_prompt,
             });
             self.respond().await?;
+            self.update_plan_file("response").await?;
         }
         Ok(())
     }
@@ -144,7 +163,72 @@ impl Agent {
         self.config.tui
     }
 
+    pub fn is_worker_mode(&self) -> bool {
+        self.config.is_worker()
+    }
+
+    pub async fn run_worker(&mut self) -> Result<()> {
+        let task_file = self
+            .config
+            .task_file
+            .clone()
+            .ok_or_else(|| anyhow!("worker mode requires --task-file"))?;
+        let task = fs::read_to_string(&task_file)
+            .with_context(|| format!("failed to read worker task {}", task_file.display()))?;
+        let worker_name = self
+            .config
+            .worker_name
+            .clone()
+            .unwrap_or_else(|| "worker".to_string());
+        let worker_id = self
+            .config
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| "worker".to_string());
+
+        let mut record = load_worker_record(&self.config.workspace, &worker_id)?;
+        record.status = WorkerStatus::Running;
+        record.updated_at = now_epoch();
+        save_worker_record(&self.config.workspace, &record)?;
+
+        ui::banner(
+            &format!("{} worker", self.config.banner_title),
+            &format!("{} - {}", self.config.banner_subtitle, worker_name),
+            &format!("{:?}", self.config.provider),
+            self.provider.model(),
+            &self.config.workspace.display().to_string(),
+            self.config.access_label(),
+            &self.config.banner_onboarding(),
+            &format!("task: {}", task_excerpt(&task)),
+        );
+
+        self.update_plan_file("startup").await?;
+        self.messages.push(Message {
+            role: Role::User,
+            content: task,
+        });
+
+        let result = self.respond().await;
+        let mut finished = load_worker_record(&self.config.workspace, &worker_id)?;
+        finished.updated_at = now_epoch();
+        match &result {
+            Ok(_) => {
+                finished.status = WorkerStatus::Finished;
+                finished.exit_status = Some(0);
+            }
+            Err(err) => {
+                finished.status = WorkerStatus::Failed;
+                finished.exit_status = Some(1);
+                finished.task = format!("{}\n\nworker error: {err}", finished.task);
+            }
+        }
+        save_worker_record(&self.config.workspace, &finished)?;
+        result
+    }
+
     pub async fn run_tui(&mut self) -> Result<()> {
+        self.ensure_auto_worktree().await?;
+        self.update_plan_file("startup").await?;
         let mut terminal = TuiGuard::enter()?;
         let banner_onboarding = self.config.banner_onboarding();
         let mut transcript = vec![TranscriptItem::new(
@@ -272,6 +356,7 @@ impl Agent {
                                 {
                                     break;
                                 }
+                                self.update_plan_file("command").await?;
                                 needs_draw = true;
                                 continue;
                             }
@@ -342,6 +427,7 @@ impl Agent {
                                 content: answer,
                             });
                             status = "ready".to_string();
+                            self.update_plan_file("response").await?;
                             needs_draw = true;
                         }
                         _ => {}
@@ -378,6 +464,14 @@ impl Agent {
                 ui::info(&self.handle_skills_command(arg).await?);
                 Ok(false)
             }
+            "/worktree" => {
+                ui::info(&self.handle_worktree_command(arg).await?);
+                Ok(false)
+            }
+            "/agents" => {
+                ui::info(&self.handle_agents_command(arg).await?);
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     ui::info(&summary);
@@ -390,7 +484,8 @@ impl Agent {
             }
             "/provider" => {
                 ui::info(&format!(
-                    "provider={:?} model={} base_url={} think={:?} show_thinking={} stops={} permissions=shell:{:?},write:{:?} access={}",
+                    "role={:?} provider={:?} model={} base_url={} think={:?} show_thinking={} stops={} permissions=shell:{:?},write:{:?} access={}",
+                    self.config.role,
                     self.config.provider,
                     self.provider.model(),
                     self.config.base_url(),
@@ -568,6 +663,20 @@ impl Agent {
                 ));
                 Ok(false)
             }
+            "/worktree" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_worktree_command(arg).await?,
+                ));
+                Ok(false)
+            }
+            "/agents" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_agents_command(arg).await?,
+                ));
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     transcript.push(TranscriptItem::new("system", summary));
@@ -578,7 +687,8 @@ impl Agent {
                 transcript.push(TranscriptItem::new(
                     "system",
                     format!(
-                        "provider={:?}\nmodel={}\nbase_url={}\nthink={:?}\npermissions=shell:{:?},write:{:?}\naccess={}",
+                        "role={:?}\nprovider={:?}\nmodel={}\nbase_url={}\nthink={:?}\npermissions=shell:{:?},write:{:?}\naccess={}",
+                        self.config.role,
                         self.config.provider,
                         self.provider.model(),
                         self.config.base_url(),
@@ -770,17 +880,26 @@ impl Agent {
     async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
         match arg {
             "" | "show" => Ok(format!(
-                "config file: {}\nloaded: {}\nprovider={:?}\nmodel={}\nworkspace={}\nautonomous={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
+                "config file: {}\nloaded: {}\nrole={:?}\nprovider={:?}\nmodel={}\nworkspace={}\ntask_file={}\nworker_id={}\nworker_name={}\nautonomous={}\nauto_worktree={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
                 self.config.config_file.display(),
                 if self.config.config_file_exists() {
                     "yes"
                 } else {
                     "no"
                 },
+                self.config.role,
                 self.config.provider,
                 self.provider.model(),
                 self.config.workspace.display(),
+                self.config
+                    .task_file
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                self.config.worker_id.as_deref().unwrap_or("none"),
+                self.config.worker_name.as_deref().unwrap_or("none"),
                 self.config.autonomous,
+                self.config.auto_worktree,
                 self.config.effective_max_tool_rounds(),
                 self.config.memory_file().display(),
                 self.config.skills_dir().display(),
@@ -887,7 +1006,260 @@ impl Agent {
         }
     }
 
+    async fn handle_worktree_command(&mut self, arg: &str) -> Result<String> {
+        let mut parts = arg.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+
+        match subcommand {
+            "" | "status" | "list" => self.tools.run_git(&["worktree", "list", "--porcelain"]).await,
+            "prune" => self.tools.run_git(&["worktree", "prune"]).await,
+            "auto" => {
+                self.ensure_auto_worktree().await?;
+                Ok(format!("auto worktree check complete: {}", self.config.workspace.display()))
+            }
+            "add" | "create" => {
+                let path = parts.next().unwrap_or_default();
+                if path.is_empty() {
+                    return Ok("usage: /worktree add <path> [branch]".to_string());
+                }
+                let branch = parts.next();
+                let mut args = vec!["worktree", "add"];
+                if let Some(branch) = branch {
+                    args.push("-b");
+                    args.push(branch);
+                }
+                args.push(path);
+                let result = self.tools.run_git(&args).await?;
+                let new_workspace = self.resolve_worktree_path(path);
+                self.switch_workspace(new_workspace)?;
+                Ok(format!(
+                    "{result}\n\nworkspace switched to {}",
+                    self.config.workspace.display()
+                ))
+            }
+            "use" | "switch" => {
+                let path = parts.next().unwrap_or_default();
+                if path.is_empty() {
+                    return Ok("usage: /worktree switch <path>".to_string());
+                }
+                let new_workspace = self.resolve_worktree_path(path);
+                self.switch_workspace(new_workspace)?;
+                Ok(format!("workspace switched to {}", self.config.workspace.display()))
+            }
+            "remove" | "rm" => {
+                let path = parts.next().unwrap_or_default();
+                if path.is_empty() {
+                    return Ok("usage: /worktree remove <path>".to_string());
+                }
+                let target = self.resolve_worktree_path(path);
+                if self.same_path(&target, &self.config.workspace) {
+                    return Ok("refusing to remove the active workspace".to_string());
+                }
+                self.tools
+                    .run_git(&["worktree", "remove", target.to_string_lossy().as_ref()])
+                    .await
+            }
+            _ => Ok(
+                "usage: /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn handle_agents_command(&mut self, arg: &str) -> Result<String> {
+        let mut parts = arg.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+
+        match subcommand {
+            "" | "list" => self.list_workers_summary(),
+            "spawn" => {
+                let spec = parts.collect::<Vec<_>>();
+                if spec.is_empty() {
+                    return Ok("usage: /agents spawn <name> | <task>".to_string());
+                }
+                let joined = spec.join(" ");
+                let (name, task) = if let Some((name, task)) = joined.split_once('|') {
+                    let name = name.trim();
+                    let task = task.trim();
+                    (
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        },
+                        task.to_string(),
+                    )
+                } else {
+                    (None, joined)
+                };
+                if task.is_empty() {
+                    return Ok("usage: /agents spawn <name> | <task>".to_string());
+                }
+                self.spawn_worker(name, task).await
+            }
+            "read" => {
+                let id = parts.next().unwrap_or_default();
+                if id.is_empty() {
+                    return Ok("usage: /agents read <id>".to_string());
+                }
+                self.read_worker_summary(id)
+            }
+            _ => Ok("usage: /agents [list|spawn <name> | <task>|read <id>]".to_string()),
+        }
+    }
+
+    async fn ensure_auto_worktree(&mut self) -> Result<()> {
+        if !self.config.auto_worktree {
+            return Ok(());
+        }
+        if !self.is_git_repo()? {
+            return Ok(());
+        }
+        if self.is_linked_worktree()? {
+            return Ok(());
+        }
+
+        let new_workspace = self.create_auto_worktree_path()?;
+        let branch = self.auto_worktree_branch_name()?;
+        let worktree_path = new_workspace.to_string_lossy().to_string();
+        let args = [
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            worktree_path.as_str(),
+            "HEAD",
+        ];
+        self.tools.run_git(&args).await?;
+        self.switch_workspace(new_workspace)?;
+        Ok(())
+    }
+
+    async fn spawn_worker(&mut self, name: Option<String>, task: String) -> Result<String> {
+        let worker_name = name.unwrap_or_else(|| "worker".to_string());
+        let worker_id = make_worker_id(&worker_name);
+        let new_workspace = self.create_worker_worktree_path(&worker_id)?;
+        let branch = self.worker_branch_name(&worker_id)?;
+        let worktree_path = new_workspace.to_string_lossy().to_string();
+        let args = [
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            worktree_path.as_str(),
+            "HEAD",
+        ];
+        self.tools.run_git(&args).await?;
+
+        sync_workspace_context(&self.config.workspace, &new_workspace)?;
+
+        let worker_task = format!("# Worker Task: {worker_name}\n\n{}\n", task.trim());
+        let task_file = worker_task_path(&self.config.workspace, &worker_id)?;
+        if let Some(parent) = task_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&task_file, worker_task)
+            .with_context(|| format!("failed to write task file {}", task_file.display()))?;
+
+        let config_file = new_workspace.join("autofix_config.json");
+        let worker_config = worker_config_snapshot(
+            &self.config,
+            &new_workspace,
+            &task_file,
+            &worker_id,
+            &worker_name,
+        );
+        write_config_snapshot(&config_file, &worker_config)?;
+
+        let log_file = worker_log_path(&self.config.workspace, &worker_id)?;
+        if let Some(parent) = log_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let log_handle = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .with_context(|| format!("failed to open worker log {}", log_file.display()))?;
+        let child_log = log_handle
+            .try_clone()
+            .context("failed to clone worker log handle")?;
+
+        let control_root = registry_root_for_workspace(&self.config.workspace)?;
+        fs::create_dir_all(control_root.join("workers"))
+            .with_context(|| format!("failed to create {}", control_root.display()))?;
+        let mut record = WorkerRecord {
+            id: worker_id.clone(),
+            name: worker_name.clone(),
+            task: task.clone(),
+            workspace: new_workspace.clone(),
+            branch: branch.clone(),
+            config_file: config_file.clone(),
+            task_file: task_file.clone(),
+            log_file: log_file.clone(),
+            pid: None,
+            status: WorkerStatus::Starting,
+            created_at: now_epoch(),
+            updated_at: now_epoch(),
+            exit_status: None,
+        };
+        save_worker_record(&self.config.workspace, &record)?;
+
+        let exe = env::current_exe().context("failed to resolve current executable")?;
+        let child = Command::new(exe)
+            .arg("--role")
+            .arg("worker")
+            .arg("--config-file")
+            .arg(&config_file)
+            .arg("--task-file")
+            .arg(&task_file)
+            .arg("--worker-id")
+            .arg(&worker_id)
+            .arg("--worker-name")
+            .arg(&worker_name)
+            .current_dir(&new_workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_handle))
+            .stderr(Stdio::from(child_log))
+            .spawn()
+            .with_context(|| format!("failed to spawn worker {}", worker_id))?;
+
+        record.pid = Some(child.id());
+        record.status = WorkerStatus::Running;
+        record.updated_at = now_epoch();
+        save_worker_record(&self.config.workspace, &record)?;
+
+        Ok(format!(
+            "spawned worker {worker_id}\nbranch: {branch}\nworkspace: {}\npid: {}\ntask: {}",
+            new_workspace.display(),
+            child.id(),
+            task_excerpt(&task)
+        ))
+    }
+
+    fn list_workers_summary(&self) -> Result<String> {
+        let records = list_worker_records(&self.config.workspace)?;
+        if records.is_empty() {
+            return Ok("workers: none".to_string());
+        }
+        Ok(format!(
+            "workers:\n{}",
+            records
+                .iter()
+                .map(summarize_worker)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+
+    fn read_worker_summary(&self, id: &str) -> Result<String> {
+        let record = load_worker_record(&self.config.workspace, id)?;
+        Ok(worker_tail_summary(&record))
+    }
+
     fn reload_context_layers(&mut self) -> Result<()> {
+        ensure_agent_doc(&self.config.workspace)?;
         let system = build_system_prompt(&self.config, &self.memory_store, &self.skills);
         self.provider = ProviderClient::new(&self.config);
         self.tools = ToolRuntime::new(
@@ -911,15 +1283,237 @@ impl Agent {
         Ok(())
     }
 
+    fn switch_workspace(&mut self, new_workspace: PathBuf) -> Result<()> {
+        let old_workspace = self.config.workspace.clone();
+        if self.same_path(&old_workspace, &new_workspace) {
+            return Ok(());
+        }
+        sync_workspace_context(&old_workspace, &new_workspace)?;
+        self.config.workspace = new_workspace.clone();
+        self.config.config_file =
+            relocate_under_workspace(&self.config.config_file, &old_workspace, &new_workspace);
+        self.config.memory_file =
+            relocate_under_workspace(&self.config.memory_file, &old_workspace, &new_workspace);
+        self.config.skills_dir =
+            relocate_under_workspace(&self.config.skills_dir, &old_workspace, &new_workspace);
+        self.memory_store = load_memory_store(&self.config.memory_file)?;
+        self.skills = load_skills(&self.config.skills_dir, self.config.active_skills())?;
+        self.reload_context_layers()?;
+        if let Ok(mut workspace) = self.completion_workspace.lock() {
+            *workspace = self.config.workspace.clone();
+        }
+        self.persist_config_file()?;
+        Ok(())
+    }
+
+    fn resolve_worktree_path(&self, path: &str) -> PathBuf {
+        let requested = Path::new(path);
+        if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.config.workspace.join(requested)
+        }
+    }
+
+    fn same_path(&self, left: &Path, right: &Path) -> bool {
+        if left == right {
+            return true;
+        }
+        match (left.canonicalize(), right.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn is_git_repo(&self) -> Result<bool> {
+        Ok(self
+            .git_output(&["rev-parse", "--is-inside-work-tree"])?
+            .map(|text| text.trim() == "true")
+            .unwrap_or(false))
+    }
+
+    fn is_linked_worktree(&self) -> Result<bool> {
+        Ok(self
+            .git_output(&["rev-parse", "--git-dir"])?
+            .map(|text| text.trim() != ".git")
+            .unwrap_or(false))
+    }
+
+    fn create_auto_worktree_path(&self) -> Result<PathBuf> {
+        let root = self
+            .git_output(&["rev-parse", "--show-toplevel"])?
+            .ok_or_else(|| anyhow!("cannot determine git root"))?;
+        let root = PathBuf::from(root.trim());
+        let repo_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repo");
+        let branch = self.auto_worktree_branch_name()?;
+        let worktrees_root = root.parent().unwrap_or(&root).join("worktrees");
+        fs::create_dir_all(&worktrees_root)
+            .with_context(|| format!("failed to create {}", worktrees_root.display()))?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let candidate = worktrees_root.join(format!(
+            "{}-{}-{}-{}",
+            repo_name,
+            sanitize_name(&branch),
+            timestamp,
+            pid
+        ));
+        Ok(candidate)
+    }
+
+    fn create_worker_worktree_path(&self, worker_id: &str) -> Result<PathBuf> {
+        let root = self
+            .git_output(&["rev-parse", "--show-toplevel"])?
+            .ok_or_else(|| anyhow!("cannot determine git root"))?;
+        let root = PathBuf::from(root.trim());
+        let repo_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repo");
+        let worktrees_root = root.parent().unwrap_or(&root).join("worktrees");
+        fs::create_dir_all(&worktrees_root)
+            .with_context(|| format!("failed to create {}", worktrees_root.display()))?;
+        let candidate = worktrees_root.join(format!(
+            "{}-{}-{}-{}",
+            repo_name,
+            sanitize_name(worker_id),
+            now_epoch(),
+            std::process::id()
+        ));
+        Ok(candidate)
+    }
+
+    fn auto_worktree_branch_name(&self) -> Result<String> {
+        let branch = self
+            .git_output(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .unwrap_or_else(|| "feature".to_string());
+        let branch = branch.trim();
+        let short_sha = self
+            .git_output(&["rev-parse", "--short", "HEAD"])?
+            .unwrap_or_else(|| "head".to_string());
+        Ok(format!(
+            "autofix/{}/{}",
+            sanitize_name(branch),
+            short_sha.trim()
+        ))
+    }
+
+    fn worker_branch_name(&self, worker_id: &str) -> Result<String> {
+        let branch = self
+            .git_output(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .unwrap_or_else(|| "feature".to_string());
+        Ok(format!(
+            "autofix/{}/{}",
+            sanitize_name(branch.trim()),
+            sanitize_name(worker_id)
+        ))
+    }
+
+    fn git_output(&self, args: &[&str]) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.config.workspace)
+            .stdin(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+            }
+            Ok(_) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn persist_config_file(&self) -> Result<()> {
         let file = self.config.snapshot_config_file();
-        let text = serde_json::to_string_pretty(&file).context("failed to serialize config")?;
-        fs::write(&self.config.config_file, text).with_context(|| {
-            format!(
-                "failed to write config file {}",
-                self.config.config_file.display()
-            )
-        })
+        write_config_snapshot(&self.config.config_file, &file)
+    }
+
+    async fn update_plan_file(&mut self, stage: &str) -> Result<()> {
+        let plan_path = self.config.workspace.join("PLAN.md");
+        let text = self.render_plan(stage)?;
+        fs::write(&plan_path, text)
+            .with_context(|| format!("failed to write plan file {}", plan_path.display()))?;
+        self.refresh_system_prompt()?;
+        Ok(())
+    }
+
+    fn render_plan(&self, stage: &str) -> Result<String> {
+        let branch = self
+            .git_output(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .unwrap_or_else(|| "unknown".to_string());
+        let status = self.git_output(&["status", "--short"])?.unwrap_or_default();
+        let changed_files = parse_git_status(&status);
+        let changed_block = if changed_files.is_empty() {
+            "- none".to_string()
+        } else {
+            changed_files
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let next_steps = if changed_files.is_empty() {
+            vec![
+                "Continue the current user task.".to_string(),
+                "Keep PLAN.md refreshed after each meaningful step.".to_string(),
+            ]
+        } else {
+            vec![
+                "Review the git diff for the listed files.".to_string(),
+                "Run a targeted validation pass before reporting complete.".to_string(),
+            ]
+        };
+
+        let next_steps_block = next_steps
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!(
+            "# PLAN\n\n## Summary\n\n- Stage: {stage}\n- Workspace: {}\n- Branch: {}\n- Provider: {:?}\n- Model: {}\n- Access: {}\n- Autonomous: {}\n- Auto worktree: {}\n- Active skills: {}\n- Memory notes: {}\n\n## Files Changed\n\n{}\n\n## Next Steps\n\n{}\n",
+            self.config.workspace.display(),
+            branch.trim(),
+            self.config.provider,
+            self.provider.model(),
+            self.config.access_label(),
+            self.config.autonomous,
+            self.config.auto_worktree,
+            if self.config.active_skills().is_empty() {
+                "none".to_string()
+            } else {
+                self.config.active_skills().join(", ")
+            },
+            self.memory_store.notes.len(),
+            changed_block,
+            next_steps_block,
+        ))
+    }
+
+    fn refresh_system_prompt(&mut self) -> Result<()> {
+        let system = build_system_prompt(&self.config, &self.memory_store, &self.skills);
+        if let Some(first) = self.messages.first_mut() {
+            first.role = Role::System;
+            first.content = system;
+        } else {
+            self.messages.insert(
+                0,
+                Message {
+                    role: Role::System,
+                    content: system,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn memory_summary(&self) -> String {
@@ -1046,11 +1640,26 @@ impl Agent {
                 content: answer.clone(),
             });
 
-            let Some(tool_call) = extract_tool_call(&answer)? else {
-                return Ok(());
+            let tool_call = match extract_tool_call(&answer) {
+                Ok(Some(tool_call)) => tool_call,
+                Ok(None) => return Ok(()),
+                Err(err) => {
+                    let message = format!(
+                        "tool call parse error: {err}\nReturn either a final answer or a single valid ```json tool block."
+                    );
+                    ui::error(&message);
+                    self.messages.push(Message {
+                        role: Role::User,
+                        content: message,
+                    });
+                    continue;
+                }
             };
 
-            let result = self.tools.execute(tool_call).await?;
+            let result = match self.execute_tool_call(tool_call).await {
+                Ok(result) => result,
+                Err(err) => format!("tool execution error: {err}"),
+            };
             ui::tool_result(&result);
             self.messages.push(Message {
                 role: Role::User,
@@ -1060,6 +1669,15 @@ impl Agent {
 
         ui::error("stopped after max tool rounds");
         Ok(())
+    }
+
+    async fn execute_tool_call(&mut self, call: ToolCall) -> Result<String> {
+        match call {
+            ToolCall::SpawnWorker { name, task } => self.spawn_worker(name, task).await,
+            ToolCall::ListWorkers => self.list_workers_summary(),
+            ToolCall::ReadWorker { id } => self.read_worker_summary(&id),
+            other => self.tools.execute(other).await,
+        }
     }
 
     fn handle_thinking(&mut self, arg: &str) {
@@ -1357,6 +1975,109 @@ fn load_skills(dir: &Path, active_skills: &[String]) -> Result<Vec<LoadedSkill>>
     Ok(loaded)
 }
 
+fn relocate_under_workspace(path: &Path, old_workspace: &Path, new_workspace: &Path) -> PathBuf {
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(old_workspace) {
+            new_workspace.join(relative)
+        } else {
+            path.to_path_buf()
+        }
+    } else if let Ok(relative) = path.strip_prefix(old_workspace) {
+        new_workspace.join(relative)
+    } else {
+        new_workspace.join(path)
+    }
+}
+
+fn sync_workspace_context(old_workspace: &Path, new_workspace: &Path) -> Result<()> {
+    copy_file_if_exists(old_workspace, new_workspace, "AGENT.md")?;
+    copy_file_if_exists(old_workspace, new_workspace, "AGENTS.md")?;
+    copy_file_if_exists(old_workspace, new_workspace, "PLAN.md")?;
+    copy_file_if_exists(old_workspace, new_workspace, "autofix_config.json")?;
+    copy_file_if_exists(old_workspace, new_workspace, "memory.json")?;
+    copy_dir_if_exists(old_workspace, new_workspace, "skills")?;
+    Ok(())
+}
+
+fn copy_file_if_exists(old_workspace: &Path, new_workspace: &Path, name: &str) -> Result<()> {
+    let source = old_workspace.join(name);
+    if !source.exists() {
+        return Ok(());
+    }
+    let dest = new_workspace.join(name);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(&source, &dest)
+        .with_context(|| format!("failed to copy {} to {}", source.display(), dest.display()))?;
+    Ok(())
+}
+
+fn copy_dir_if_exists(old_workspace: &Path, new_workspace: &Path, name: &str) -> Result<()> {
+    let source = old_workspace.join(name);
+    if !source.exists() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(&source)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        let relative = path.strip_prefix(old_workspace).unwrap_or(path);
+        let dest = new_workspace.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dest)
+                .with_context(|| format!("failed to create {}", dest.display()))?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(path, &dest).with_context(|| {
+                format!("failed to copy {} to {}", path.display(), dest.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_config_snapshot(path: &Path, file: &crate::config::ConfigFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(file).context("failed to serialize config")?;
+    fs::write(path, text).with_context(|| format!("failed to write config file {}", path.display()))
+}
+
+fn worker_config_snapshot(
+    config: &Config,
+    worker_workspace: &Path,
+    task_file: &Path,
+    worker_id: &str,
+    worker_name: &str,
+) -> crate::config::ConfigFile {
+    let mut snapshot = config.snapshot_config_file();
+    snapshot.role = Some(AgentRole::Worker);
+    snapshot.workspace = Some(worker_workspace.to_path_buf());
+    snapshot.task_file = Some(task_file.to_path_buf());
+    snapshot.worker_id = Some(worker_id.to_string());
+    snapshot.worker_name = Some(worker_name.to_string());
+    snapshot.memory_file = Some(PathBuf::from("memory.json"));
+    snapshot.skills_dir = Some(PathBuf::from("skills"));
+    snapshot.auto_worktree = Some(false);
+    snapshot.autonomous = Some(true);
+    snapshot.tui = Some(false);
+    snapshot.full_system_access = Some(false);
+    snapshot.dangerously_allow_shell = Some(false);
+    snapshot.auto_write = Some(false);
+    snapshot.approval_mode = Some(PermissionMode::Allow);
+    snapshot.shell_approval = Some(PermissionMode::Allow);
+    snapshot.write_approval = Some(PermissionMode::Allow);
+    snapshot
+}
+
 fn load_skill(dir: &Path, name: &str) -> Result<Option<LoadedSkill>> {
     let candidates = [
         dir.join(format!("{name}.md")),
@@ -1402,7 +2123,75 @@ fn build_system_prompt(config: &Config, memory: &MemoryStore, skills: &[LoadedSk
         sections.push(rendered);
     }
 
+    if let Some(agents) = read_workspace_note(&config.workspace, "AGENT.md")
+        .or_else(|| read_workspace_note(&config.workspace, "AGENTS.md"))
+    {
+        sections.push(format!("Workspace instructions:\n{}", agents.trim()));
+    }
+
+    if let Some(plan) = read_workspace_note(&config.workspace, "PLAN.md") {
+        sections.push(format!("Session plan:\n{}", plan.trim()));
+    }
+
+    if config.is_worker() {
+        sections.push(
+            "Worker orchestration:\n- You are an isolated worker agent running in a dedicated worktree.\n- Work only on the assigned task and report concise progress.\n- Do not spawn additional workers.\n- Keep the result scoped to the branch and workspace you were given."
+                .to_string(),
+        );
+    } else {
+        sections.push(
+            "Master orchestration:\n- You may delegate independent subproblems to isolated worker agents.\n- Prefer workers for side tasks that can live in their own worktree and context.\n- Review worker summaries before merging their branches.\n- Keep the main chat focused on coordination, review, and final decisions."
+                .to_string(),
+        );
+    }
+
     sections.join("\n\n")
+}
+
+fn read_workspace_note(workspace: &Path, name: &str) -> Option<String> {
+    let path = workspace.join(name);
+    let text = fs::read_to_string(path).ok()?;
+    Some(text.lines().take(120).collect::<Vec<_>>().join("\n"))
+}
+
+fn ensure_agent_doc(workspace: &Path) -> Result<()> {
+    let agent_md = workspace.join("AGENT.md");
+    if agent_md.exists() {
+        return Ok(());
+    }
+
+    let agents_md = workspace.join("AGENTS.md");
+    if agents_md.exists() {
+        fs::copy(&agents_md, &agent_md).with_context(|| {
+            format!("failed to initialize AGENT.md from {}", agents_md.display())
+        })?;
+        return Ok(());
+    }
+
+    let default = r#"# AGENT.md
+
+## Operating Rules
+
+- Keep PLAN.md current and rewrite it when the session state changes.
+- Use PLAN.md for summary, files changed, and next steps.
+- Prefer isolated worktrees for feature work when auto_worktree is enabled.
+- Use isolated worker agents for side tasks that can live in their own worktree and context.
+- Keep the master agent focused on coordination, review, and final decisions.
+- Keep memory.json and skills/ as durable context, not repeated chat history.
+- Do not revert unrelated user changes.
+- Preserve kernel backport constraints: minimal patching, semantic conflict resolution, targeted validation.
+
+## Session Flow
+
+- Update PLAN.md after startup, config reloads, worktree changes, skill changes, memory changes, and after tool rounds that change the codebase.
+- Keep the plan short and actionable.
+- When blocked, record the blocker in PLAN.md and stop adding speculative steps.
+- When delegating to a worker, copy only the scoped task into that worker's prompt and let the worker own its own PLAN.md.
+"#;
+
+    fs::write(&agent_md, default)
+        .with_context(|| format!("failed to initialize {}", agent_md.display()))?;
+    Ok(())
 }
 
 fn draw_tui(
@@ -1451,6 +2240,15 @@ fn draw_tui(
                         Style::default().fg(Color::Blue)
                     },
                 ),
+                Span::raw(" / "),
+                Span::styled(
+                    if agent.config.is_worker() {
+                        "worker"
+                    } else {
+                        "master"
+                    },
+                    Style::default().fg(Color::Magenta),
+                ),
             ]),
         ])
         .block(Block::default().borders(Borders::ALL).title("agent"));
@@ -1470,6 +2268,18 @@ fn draw_tui(
                 } else {
                     "workspace"
                 }
+            )),
+            Line::from(format!(
+                "role: {}",
+                if agent.config.is_worker() {
+                    "worker"
+                } else {
+                    "master"
+                }
+            )),
+            Line::from(format!(
+                "worker: {}",
+                agent.config.worker_id.as_deref().unwrap_or("none")
             )),
         ])
         .block(Block::default().borders(Borders::ALL).title("state"));
@@ -1717,6 +2527,8 @@ fn tui_help_panel() -> Vec<Line<'static>> {
         Line::from("Commands"),
         Line::from("  /help /provider /models /use-model"),
         Line::from("  /thinking /clear /exit"),
+        Line::from("  /worktree /worktree list /worktree auto /worktree add <path>"),
+        Line::from("  /agents /agents spawn <name> | <task> /agents read <id>"),
         Line::from(""),
         Line::from("The full line-mode command surface still handles shell, terminal, writes, and permissions."),
     ]
@@ -1779,7 +2591,7 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
@@ -1901,6 +2713,37 @@ fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
     }
 }
 
+fn sanitize_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+}
+
+fn parse_git_status(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            if line.len() < 3 {
+                return Some(line.to_string());
+            }
+            let path = line[3..].trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(format!("{line}"))
+            }
+        })
+        .collect()
+}
+
 fn format_stop_sequences(stops: &[String]) -> String {
     if stops.is_empty() {
         "none".to_string()
@@ -1969,6 +2812,9 @@ Available tools:
 - read_file: {"tool":"read_file","path":"relative/path"}
 - write_file: {"tool":"write_file","path":"relative/path","content":"full file content"}
 - run_shell: {"tool":"run_shell","command":"cargo test"}
+- spawn_worker: {"tool":"spawn_worker","name":"optional label","task":"isolated task text"}
+- list_workers: {"tool":"list_workers"}
+- read_worker: {"tool":"read_worker","id":"worker-id"}
 
 When you need tool output, return only the tool-call JSON block. After receiving tool results, continue the backporting workflow."#
         .to_string()

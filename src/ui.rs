@@ -302,7 +302,7 @@ pub fn help_text() -> &'static str {
     r#"Commands
   /help              show this help
   /config            show current config file state
-  /config reload     reload config.json from disk
+  /config reload     reload autofix_config.json from disk
   /memory            show memory notes
   /memory add <text> add a durable memory note
   /memory clear      clear all memory notes
@@ -312,6 +312,16 @@ pub fn help_text() -> &'static str {
   /skills reload     reload active skill files
   /skills enable <name> add a skill to the active set
   /skills disable <name> remove a skill from the active set
+  /worktree          show git worktree state
+  /worktree list     list worktrees in porcelain format
+  /worktree auto     create and switch to an auto worktree if needed
+  /worktree add <path> [branch] create a new worktree and switch to it
+  /worktree switch <path> switch the active workspace to an existing worktree
+  /worktree remove <path> remove a worktree
+  /worktree prune    prune stale worktree metadata
+  /agents            list isolated worker agents
+  /agents spawn <name> | <task> spawn a worker in a fresh worktree
+  /agents read <id>  show worker status and file paths
   /provider          show provider configuration
   /permissions       show shell/write approval modes
   /permissions ask   ask before shell commands and file writes

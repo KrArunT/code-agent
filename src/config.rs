@@ -33,12 +33,22 @@ pub enum PermissionMode {
     Deny,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRole {
+    Master,
+    Worker,
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "autofix")]
 #[command(about = "Interactive coding agent with multi-provider support")]
 pub struct Config {
-    #[arg(long, env = "AGENT_CONFIG", default_value = "config.json")]
+    #[arg(long, env = "AGENT_CONFIG", default_value = "autofix_config.json")]
     pub config_file: PathBuf,
+
+    #[arg(long, value_enum, env = "AGENT_ROLE", default_value = "master")]
+    pub role: AgentRole,
 
     #[arg(long, value_enum, env = "AGENT_PROVIDER", default_value = "ollama")]
     pub provider: ProviderKind,
@@ -55,6 +65,15 @@ pub struct Config {
     #[arg(long, env = "AGENT_WORKSPACE", default_value = ".")]
     pub workspace: PathBuf,
 
+    #[arg(long, env = "AGENT_TASK_FILE")]
+    pub task_file: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_WORKER_ID")]
+    pub worker_id: Option<String>,
+
+    #[arg(long, env = "AGENT_WORKER_NAME")]
+    pub worker_name: Option<String>,
+
     #[arg(long, env = "AGENT_MEMORY_FILE", default_value = "memory.json")]
     pub memory_file: PathBuf,
 
@@ -69,6 +88,9 @@ pub struct Config {
 
     #[arg(long, env = "AGENT_AUTO_WRITE")]
     pub auto_write: bool,
+
+    #[arg(long, env = "AGENT_AUTO_WORKTREE")]
+    pub auto_worktree: bool,
 
     #[arg(long, value_enum, env = "AGENT_APPROVAL_MODE", default_value = "ask")]
     pub approval_mode: PermissionMode,
@@ -126,16 +148,21 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfigFile {
+    pub role: Option<AgentRole>,
     pub provider: Option<ProviderKind>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub workspace: Option<PathBuf>,
+    pub task_file: Option<PathBuf>,
+    pub worker_id: Option<String>,
+    pub worker_name: Option<String>,
     pub memory_file: Option<PathBuf>,
     pub skills_dir: Option<PathBuf>,
     pub system: Option<String>,
     pub dangerously_allow_shell: Option<bool>,
     pub auto_write: Option<bool>,
+    pub auto_worktree: Option<bool>,
     pub approval_mode: Option<PermissionMode>,
     pub shell_approval: Option<PermissionMode>,
     pub write_approval: Option<PermissionMode>,
@@ -167,19 +194,25 @@ impl Config {
     }
 
     pub fn config_file_exists(&self) -> bool {
-        self.config_file.exists()
+        self.config_file.exists() || self.legacy_config_file().exists()
     }
 
     pub fn load_config_file(&self) -> Result<Option<ConfigFile>> {
-        if !self.config_file.exists() {
-            return Ok(None);
-        }
-        let text = fs::read_to_string(&self.config_file).with_context(|| {
-            format!("failed to read config file {}", self.config_file.display())
-        })?;
-        let file = serde_json::from_str::<ConfigFile>(&text).with_context(|| {
-            format!("failed to parse config file {}", self.config_file.display())
-        })?;
+        let path = if self.config_file.exists() {
+            self.config_file.clone()
+        } else {
+            let legacy = self.legacy_config_file();
+            if legacy.exists() {
+                legacy
+            } else {
+                return Ok(None);
+            }
+        };
+        let path_display = path.display().to_string();
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config file {}", path_display))?;
+        let file = serde_json::from_str::<ConfigFile>(&text)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
         Ok(Some(file))
     }
 
@@ -191,6 +224,9 @@ impl Config {
     }
 
     fn apply_config_file(&mut self, file: ConfigFile) {
+        if let Some(value) = file.role {
+            self.role = value;
+        }
         if let Some(value) = file.provider {
             self.provider = value;
         }
@@ -206,6 +242,15 @@ impl Config {
         if let Some(value) = file.workspace {
             self.workspace = value;
         }
+        if let Some(value) = file.task_file {
+            self.task_file = Some(value);
+        }
+        if let Some(value) = file.worker_id {
+            self.worker_id = Some(value);
+        }
+        if let Some(value) = file.worker_name {
+            self.worker_name = Some(value);
+        }
         if let Some(value) = file.memory_file {
             self.memory_file = value;
         }
@@ -220,6 +265,9 @@ impl Config {
         }
         if let Some(value) = file.auto_write {
             self.auto_write = value;
+        }
+        if let Some(value) = file.auto_worktree {
+            self.auto_worktree = value;
         }
         if let Some(value) = file.approval_mode {
             self.approval_mode = value;
@@ -280,6 +328,10 @@ impl Config {
         !self.hide_thinking
     }
 
+    pub fn is_worker(&self) -> bool {
+        matches!(self.role, AgentRole::Worker)
+    }
+
     pub fn shell_permission(&self) -> PermissionMode {
         if self.full_system_access || self.dangerously_allow_shell {
             PermissionMode::Allow
@@ -309,6 +361,7 @@ impl Config {
             vec![
                 "/help commands".to_string(),
                 "/models local models".to_string(),
+                "/agents spawn task isolation".to_string(),
                 "/permissions safety".to_string(),
                 "/terminal real shell".to_string(),
                 "/exit quit".to_string(),
@@ -344,16 +397,21 @@ impl Config {
 
     pub fn snapshot_config_file(&self) -> ConfigFile {
         ConfigFile {
+            role: Some(self.role),
             provider: Some(self.provider),
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
             workspace: Some(self.workspace.clone()),
+            task_file: self.task_file.clone(),
+            worker_id: self.worker_id.clone(),
+            worker_name: self.worker_name.clone(),
             memory_file: Some(self.memory_file.clone()),
             skills_dir: Some(self.skills_dir.clone()),
             system: self.system.clone(),
             dangerously_allow_shell: Some(self.dangerously_allow_shell),
             auto_write: Some(self.auto_write),
+            auto_worktree: Some(self.auto_worktree),
             approval_mode: Some(self.approval_mode),
             shell_approval: self.shell_approval,
             write_approval: self.write_approval,
@@ -380,6 +438,13 @@ impl Config {
         }
     }
 
+    fn legacy_config_file(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("config.json")
+    }
+
     async fn finish_resolve(mut self) -> Result<Self> {
         self.workspace = self.workspace.canonicalize().map_err(|err| {
             anyhow!(
@@ -389,6 +454,25 @@ impl Config {
         })?;
         self.memory_file = self.resolve_workspace_path(&self.memory_file);
         self.skills_dir = self.resolve_workspace_path(&self.skills_dir);
+        if let Some(task_file) = self.task_file.clone() {
+            if !task_file.is_absolute() {
+                self.task_file = Some(self.resolve_workspace_path(&task_file));
+            }
+        }
+
+        if self.is_worker() {
+            self.tui = false;
+            self.auto_worktree = false;
+            self.autonomous = true;
+            self.full_system_access = false;
+            self.dangerously_allow_shell = false;
+            self.auto_write = false;
+            self.shell_approval = Some(PermissionMode::Allow);
+            self.write_approval = Some(PermissionMode::Allow);
+            if self.task_file.is_none() {
+                return Err(anyhow!("worker mode requires --task-file"));
+            }
+        }
 
         if self.api_key.is_none() {
             self.api_key = match self.provider {

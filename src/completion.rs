@@ -9,6 +9,7 @@ use std::{
     borrow::Cow,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 const COMMANDS: &[&str] = &[
@@ -25,6 +26,7 @@ const COMMANDS: &[&str] = &[
     "/permissions",
     "/provider",
     "/read",
+    "/agents",
     "/attach",
     "/shell",
     "/show-thinking",
@@ -38,20 +40,33 @@ const COMMANDS: &[&str] = &[
 
 #[derive(Clone)]
 pub struct AgentCompleter {
-    workspace: PathBuf,
+    workspace: Arc<Mutex<PathBuf>>,
     shell_mode: bool,
 }
 
 impl AgentCompleter {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
-            workspace,
+            workspace: Arc::new(Mutex::new(workspace)),
             shell_mode: false,
         }
     }
 
     pub fn set_shell_mode(&mut self, shell_mode: bool) {
         self.shell_mode = shell_mode;
+    }
+
+    pub fn set_workspace(&mut self, workspace: PathBuf) {
+        if let Ok(mut current) = self.workspace.lock() {
+            *current = workspace;
+        }
+    }
+
+    pub fn workspace(&self) -> PathBuf {
+        self.workspace
+            .lock()
+            .map(|path| path.clone())
+            .unwrap_or_else(|_| PathBuf::new())
     }
 }
 
@@ -73,13 +88,14 @@ impl Completer for AgentCompleter {
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let prefix = &line[..pos];
+        let workspace = self.workspace();
 
         if prefix.starts_with('/') {
-            return Ok(complete_command_or_arg(&self.workspace, prefix));
+            return Ok(complete_command_or_arg(&workspace, prefix));
         }
 
         if self.shell_mode {
-            return Ok(complete_shell_path(&self.workspace, prefix));
+            return Ok(complete_shell_path(&workspace, prefix));
         }
 
         Ok((pos, Vec::new()))
@@ -130,7 +146,31 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
             &["auto", "on", "off", "low", "medium", "high", "show", "hide"],
         ),
         "/stop" => complete_words(current_word(prefix).1, &["add", "set", "clear"]),
+        "/worktree" => complete_worktree(prefix, workspace),
+        "/agents" => complete_words(current_word(prefix).1, &["list", "spawn", "read"]),
         _ => (prefix.len(), Vec::new()),
+    }
+}
+
+fn complete_worktree(prefix: &str, workspace: &Path) -> (usize, Vec<Pair>) {
+    let parts = prefix.split_whitespace().collect::<Vec<_>>();
+    if parts.len() <= 1 && !prefix.ends_with(' ') {
+        return complete_words(
+            current_word(prefix).1,
+            &["status", "list", "auto", "add", "use", "remove", "prune"],
+        );
+    }
+
+    match parts.get(1).copied().unwrap_or_default() {
+        "add" | "use" | "remove" => {
+            let arg_start = prefix.rfind(' ').map(|idx| idx + 1).unwrap_or(prefix.len());
+            let arg_prefix = &prefix[arg_start..];
+            (arg_start, path_pairs(workspace, arg_prefix))
+        }
+        _ => complete_words(
+            current_word(prefix).1,
+            &["status", "list", "auto", "add", "use", "remove", "prune"],
+        ),
     }
 }
 
