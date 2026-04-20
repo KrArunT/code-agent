@@ -99,7 +99,7 @@ The installed binary is named `autofix`.
 
 ## Config
 
-The agent reads `autofix_config.json` from the current working directory when it starts, if the file exists. You can reload the same file during a session with `/config reload`.
+The agent reads `autofix_config.json` from the current working directory when it starts, if the file exists. It also watches that file’s modified time and auto-reloads the saved config before the next prompt or tool round when the file changes. Use `/config reload` for an explicit refresh.
 
 The included [`autofix_config.json`](autofix_config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, the autonomy toggle, and `auto_worktree`.
 

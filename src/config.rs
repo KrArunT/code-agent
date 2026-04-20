@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, time::SystemTime};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -202,6 +202,18 @@ impl Config {
 
     pub fn config_file_exists(&self) -> bool {
         self.config_file.exists() || self.legacy_config_file().exists()
+    }
+
+    pub fn config_file_modified_time(&self) -> Result<Option<SystemTime>> {
+        let Some(path) = self.config_source_path() else {
+            return Ok(None);
+        };
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("failed to inspect config file {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("failed to read config file time {}", path.display()))?;
+        Ok(Some(modified))
     }
 
     pub fn load_config_file(&self) -> Result<Option<ConfigFile>> {
@@ -456,6 +468,19 @@ impl Config {
             .join("config.json")
     }
 
+    fn config_source_path(&self) -> Option<PathBuf> {
+        if self.config_file.exists() {
+            Some(self.config_file.clone())
+        } else {
+            let legacy = self.legacy_config_file();
+            if legacy.exists() {
+                Some(legacy)
+            } else {
+                None
+            }
+        }
+    }
+
     async fn finish_resolve(mut self) -> Result<Self> {
         self.workspace = self.workspace.canonicalize().map_err(|err| {
             anyhow!(
@@ -603,5 +628,43 @@ fn ollama_tags_url(base_url: &str) -> String {
         format!("{prefix}/api/tags")
     } else {
         format!("{}/api/tags", base_url.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn config_file_modified_time_prefers_legacy_file_when_canonical_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "autofix-config-time-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let canonical = dir.join("autofix_config.json");
+        let legacy = dir.join("config.json");
+        fs::write(&legacy, "{}").expect("failed to write legacy config");
+
+        let config = Config::parse_from([
+            "autofix",
+            "--config-file",
+            canonical.to_str().expect("canonical path not utf-8"),
+        ]);
+
+        let modified = config
+            .config_file_modified_time()
+            .expect("failed to inspect config time")
+            .expect("expected legacy config time");
+        assert!(modified <= SystemTime::now());
     }
 }

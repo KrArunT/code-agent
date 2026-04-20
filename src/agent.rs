@@ -65,6 +65,7 @@ pub struct Agent {
     memory_store: MemoryStore,
     skills: Vec<LoadedSkill>,
     completion_workspace: Arc<Mutex<PathBuf>>,
+    last_config_mtime: Option<SystemTime>,
     progress: String,
     session_dirty: bool,
     session_interrupt: Arc<AtomicBool>,
@@ -88,6 +89,7 @@ impl Agent {
         let skills = load_skills(&config.skills_dir, config.active_skills())?;
         let system = build_system_prompt(&config, &memory_store, &skills);
         let session = initialize_session(&config)?;
+        let last_config_mtime = config.config_file_modified_time()?;
         let mut messages = vec![Message {
             role: Role::System,
             content: system,
@@ -105,6 +107,7 @@ impl Agent {
             memory_store,
             skills,
             completion_workspace: Arc::new(Mutex::new(completion_workspace)),
+            last_config_mtime,
             progress: String::new(),
             session_dirty: false,
             session_interrupt: Arc::new(AtomicBool::new(false)),
@@ -141,6 +144,7 @@ impl Agent {
         self.load_editor_history(&mut editor)?;
 
         loop {
+            self.maybe_reload_config_if_changed().await?;
             if let Some(helper) = editor.helper_mut() {
                 helper.set_shell_mode(self.shell_mode);
             }
@@ -291,6 +295,9 @@ impl Agent {
         let mut history_index: Option<usize> = None;
 
         loop {
+            if self.maybe_reload_config_if_changed().await? {
+                needs_draw = true;
+            }
             let size = terminal.inner().size()?;
             let layout = tui_layout(size);
             let transcript_len = transcript_content_len(&transcript);
@@ -1167,7 +1174,9 @@ impl Agent {
         self.config.reload_from_disk().await?;
         self.memory_store = load_memory_store(self.config.memory_file())?;
         self.skills = load_skills(self.config.skills_dir(), self.config.active_skills())?;
-        self.reload_context_layers()
+        self.reload_context_layers()?;
+        self.refresh_config_stamp()?;
+        Ok(())
     }
 
     async fn handle_memory_command(&mut self, arg: &str) -> Result<String> {
@@ -1811,9 +1820,56 @@ impl Agent {
         }
     }
 
-    fn persist_config_file(&self) -> Result<()> {
+    fn persist_config_file(&mut self) -> Result<()> {
         let file = self.config.snapshot_config_file();
-        write_config_snapshot(&self.config.config_file, &file)
+        write_config_snapshot(&self.config.config_file, &file)?;
+        self.refresh_config_stamp()?;
+        Ok(())
+    }
+
+    fn refresh_config_stamp(&mut self) -> Result<()> {
+        self.last_config_mtime = self.config.config_file_modified_time()?;
+        Ok(())
+    }
+
+    async fn maybe_reload_config_if_changed(&mut self) -> Result<bool> {
+        let current = match self.config.config_file_modified_time() {
+            Ok(current) => current,
+            Err(err) => {
+                ui::error(&format!("failed to inspect config file for reload: {err}"));
+                return Ok(false);
+            }
+        };
+        if current == self.last_config_mtime {
+            return Ok(false);
+        }
+
+        self.last_config_mtime = current;
+        if current.is_none() {
+            return Ok(false);
+        }
+
+        let previous_workspace = self.config.workspace.clone();
+        if let Err(err) = self.reload_from_config_file().await {
+            ui::error(&format!(
+                "auto-reload failed for {}: {err}",
+                self.config.config_file.display()
+            ));
+            return Ok(false);
+        }
+        if self.config.workspace != previous_workspace {
+            self.session.workspace = self.config.workspace.clone();
+            self.session.touch();
+            self.persist_session_state()?;
+            let _ = self.completion_workspace.lock().map(|mut workspace| {
+                *workspace = self.config.workspace.clone();
+            });
+        }
+        self.set_progress(format!(
+            "reloaded config from {}",
+            self.config.config_file.display()
+        ));
+        Ok(true)
     }
 
     async fn update_plan_file(&mut self, stage: &str) -> Result<()> {
@@ -1988,6 +2044,7 @@ impl Agent {
         let total_rounds = self.config.effective_max_tool_rounds();
         let mut warned_near_limit = false;
         for round in 0..=total_rounds {
+            self.maybe_reload_config_if_changed().await?;
             if !warned_near_limit && round >= total_rounds.saturating_sub(1) {
                 self.messages.push(Message {
                     role: Role::System,
