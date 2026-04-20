@@ -1,0 +1,23 @@
+{
+  "provider": "ollama",
+  "workspace": ".",
+  "autonomous": true,
+  "max_tool_rounds": 50,
+  "system": "You are an autonomous Linux kernel backporting agent running inside a local workspace.",
+  "approval_mode": "ask",
+  "think": "auto",
+  "hide_thinking": false,
+  "stop_sequences": [],
+  "tui": false,
+  "full_system_access": false,
+  "banner_title": "AutoFix",
+  "banner_subtitle": "An autonomous coding agent",
+  "banner_tip": "start with a backport commit ID, target kernel version, or a local patch series",
+  "banner_onboarding": [
+    "/help commands",
+    "/models local models",
+    "/permissions safety",
+    "/terminal real shell",
+    "/exit quit"
+  ]
+}

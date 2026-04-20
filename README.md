@@ -39,6 +39,14 @@ REPO_URL=https://github.com/KrArunT/code-agent.git BRANCH=main INSTALL_ROOT=$HOM
 
 The installed binary is named `autofix`.
 
+## Config
+
+The agent reads `config.json` from the current working directory when it starts, if the file exists. You can reload the same file during a session with `/config reload`.
+
+The included [`config.json`](config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, and the autonomy toggle.
+
+Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. The agent still stops at a finite safety cap, but the cap is much higher than the default interactive mode.
+
 ## Quick Start
 
 Run with local Ollama and auto-pick a local model:
@@ -190,6 +198,8 @@ Workspace commands:
 - `/list [path]` lists files under the workspace.
 - `/read <path>` prints a file.
 - `/write <path>` writes content until a line containing only `.`.
+- `/config` shows the current config file state.
+- `/config reload` reloads `config.json` from disk.
 - `/attach file <path>` queues a file to prepend to the next prompt.
 - `/attach image <path>` queues an image reference and metadata to prepend to the next prompt.
 - `/attach show` shows queued prompt attachments.

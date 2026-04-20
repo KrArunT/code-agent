@@ -358,6 +358,10 @@ impl Agent {
                 ui::info("chat mode enabled");
                 Ok(false)
             }
+            "/config" => {
+                ui::info(&self.handle_config_command(arg).await?);
+                Ok(false)
+            }
             "/attach" => {
                 if let Some(summary) = self.handle_attach_command(arg)? {
                     ui::info(&summary);
@@ -525,6 +529,13 @@ impl Agent {
             }
             "/help" => {
                 transcript.push(TranscriptItem::new("system", tui_help_text()));
+                Ok(false)
+            }
+            "/config" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_config_command(arg).await?,
+                ));
                 Ok(false)
             }
             "/attach" => {
@@ -726,6 +737,62 @@ impl Agent {
         }
     }
 
+    async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
+        match arg {
+            "" | "show" => Ok(format!(
+                "config file: {}\nloaded: {}\nprovider={:?}\nmodel={}\nworkspace={}\nautonomous={}\nmax_tool_rounds={}",
+                self.config.config_file.display(),
+                if self.config.config_file_exists() {
+                    "yes"
+                } else {
+                    "no"
+                },
+                self.config.provider,
+                self.provider.model(),
+                self.config.workspace.display(),
+                self.config.autonomous,
+                self.config.effective_max_tool_rounds()
+            )),
+            "reload" => {
+                self.reload_from_config_file().await?;
+                Ok(format!(
+                    "reloaded config from {}",
+                    self.config.config_file.display()
+                ))
+            }
+            _ => Ok("usage: /config [show|reload]".to_string()),
+        }
+    }
+
+    async fn reload_from_config_file(&mut self) -> Result<()> {
+        self.config.reload_from_disk().await?;
+        self.provider = ProviderClient::new(&self.config);
+        self.tools = ToolRuntime::new(
+            self.config.workspace.clone(),
+            self.config.shell_permission(),
+            self.config.write_permission(),
+            self.config.full_system_access,
+        );
+        let system = self
+            .config
+            .system
+            .clone()
+            .unwrap_or_else(default_system_prompt);
+        if let Some(first) = self.messages.first_mut() {
+            first.role = Role::System;
+            first.content = system;
+        } else {
+            self.messages.insert(
+                0,
+                Message {
+                    role: Role::System,
+                    content: system,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn compose_user_prompt(&mut self, input: &str) -> String {
         let attachments = std::mem::take(&mut self.prompt_attachments);
         compose_prompt_with_attachments(input, &attachments)
@@ -747,7 +814,7 @@ impl Agent {
     }
 
     async fn respond(&mut self) -> Result<()> {
-        for _ in 0..=self.config.max_tool_rounds {
+        for _ in 0..=self.config.effective_max_tool_rounds() {
             ui::assistant_start()?;
             let mut showed_thinking = false;
             let mut showed_answer = false;
@@ -1437,7 +1504,7 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {

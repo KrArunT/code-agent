@@ -301,6 +301,8 @@ pub fn clear_screen() -> io::Result<()> {
 pub fn help_text() -> &'static str {
     r#"Commands
   /help              show this help
+  /config            show current config file state
+  /config reload     reload config.json from disk
   /provider          show provider configuration
   /permissions       show shell/write approval modes
   /permissions ask   ask before shell commands and file writes

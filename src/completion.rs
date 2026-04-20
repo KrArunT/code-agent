@@ -17,6 +17,7 @@ const COMMANDS: &[&str] = &[
     "/exit",
     "/exit-shell",
     "/help",
+    "/config",
     "/hide-thinking",
     "/list",
     "/models",
@@ -104,6 +105,7 @@ fn complete_command_or_arg(workspace: &Path, prefix: &str) -> (usize, Vec<Pair>)
                 _ => complete_words(current_word(prefix).1, &["show", "clear", "file", "image"]),
             }
         }
+        "/config" => complete_words(current_word(prefix).1, &["show", "reload"]),
         "/permissions" => complete_words(
             current_word(prefix).1,
             &["ask", "allow", "deny", "shell", "write"],

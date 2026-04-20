@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
-use std::{env, path::PathBuf};
+use serde::{Deserialize, Serialize};
+use std::{env, fs, path::PathBuf};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Openai,
     Anthropic,
@@ -13,7 +14,8 @@ pub enum ProviderKind {
     CustomOpenai,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkMode {
     Auto,
     On,
@@ -23,17 +25,21 @@ pub enum ThinkMode {
     High,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     Ask,
     Allow,
     Deny,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "autofix")]
 #[command(about = "Interactive coding agent with multi-provider support")]
 pub struct Config {
+    #[arg(long, env = "AGENT_CONFIG", default_value = "config.json")]
+    pub config_file: PathBuf,
+
     #[arg(long, value_enum, env = "AGENT_PROVIDER", default_value = "ollama")]
     pub provider: ProviderKind,
 
@@ -69,6 +75,9 @@ pub struct Config {
 
     #[arg(long, env = "AGENT_MAX_TOOL_ROUNDS", default_value_t = 6)]
     pub max_tool_rounds: usize,
+
+    #[arg(long, env = "AGENT_AUTONOMOUS")]
+    pub autonomous: bool,
 
     #[arg(long, value_enum, env = "AGENT_THINK", default_value = "auto")]
     pub think: ThinkMode,
@@ -106,8 +115,197 @@ pub struct Config {
     pub banner_onboarding: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigFile {
+    pub provider: Option<ProviderKind>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub workspace: Option<PathBuf>,
+    pub system: Option<String>,
+    pub dangerously_allow_shell: Option<bool>,
+    pub auto_write: Option<bool>,
+    pub approval_mode: Option<PermissionMode>,
+    pub shell_approval: Option<PermissionMode>,
+    pub write_approval: Option<PermissionMode>,
+    pub max_tool_rounds: Option<usize>,
+    pub autonomous: Option<bool>,
+    pub think: Option<ThinkMode>,
+    pub hide_thinking: Option<bool>,
+    pub stop_sequences: Option<Vec<String>>,
+    pub tui: Option<bool>,
+    pub full_system_access: Option<bool>,
+    pub banner_title: Option<String>,
+    pub banner_subtitle: Option<String>,
+    pub banner_tip: Option<String>,
+    pub banner_onboarding: Option<Vec<String>>,
+}
+
 impl Config {
     pub async fn resolve(mut self) -> Result<Self> {
+        self.apply_config_file_if_present()?;
+        self.finish_resolve().await
+    }
+
+    pub async fn reload_from_disk(&mut self) -> Result<()> {
+        self.apply_config_file_if_present()?;
+        let resolved = self.clone().finish_resolve().await?;
+        *self = resolved;
+        Ok(())
+    }
+
+    pub fn config_file_exists(&self) -> bool {
+        self.config_file.exists()
+    }
+
+    pub fn load_config_file(&self) -> Result<Option<ConfigFile>> {
+        if !self.config_file.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&self.config_file).with_context(|| {
+            format!("failed to read config file {}", self.config_file.display())
+        })?;
+        let file = serde_json::from_str::<ConfigFile>(&text).with_context(|| {
+            format!("failed to parse config file {}", self.config_file.display())
+        })?;
+        Ok(Some(file))
+    }
+
+    fn apply_config_file_if_present(&mut self) -> Result<()> {
+        if let Some(file) = self.load_config_file()? {
+            self.apply_config_file(file);
+        }
+        Ok(())
+    }
+
+    fn apply_config_file(&mut self, file: ConfigFile) {
+        if let Some(value) = file.provider {
+            self.provider = value;
+        }
+        if let Some(value) = file.model {
+            self.model = Some(value);
+        }
+        if let Some(value) = file.base_url {
+            self.base_url = Some(value);
+        }
+        if let Some(value) = file.api_key {
+            self.api_key = Some(value);
+        }
+        if let Some(value) = file.workspace {
+            self.workspace = value;
+        }
+        if let Some(value) = file.system {
+            self.system = Some(value);
+        }
+        if let Some(value) = file.dangerously_allow_shell {
+            self.dangerously_allow_shell = value;
+        }
+        if let Some(value) = file.auto_write {
+            self.auto_write = value;
+        }
+        if let Some(value) = file.approval_mode {
+            self.approval_mode = value;
+        }
+        if let Some(value) = file.shell_approval {
+            self.shell_approval = Some(value);
+        }
+        if let Some(value) = file.write_approval {
+            self.write_approval = Some(value);
+        }
+        if let Some(value) = file.max_tool_rounds {
+            self.max_tool_rounds = value;
+        }
+        if let Some(value) = file.autonomous {
+            self.autonomous = value;
+        }
+        if let Some(value) = file.think {
+            self.think = value;
+        }
+        if let Some(value) = file.hide_thinking {
+            self.hide_thinking = value;
+        }
+        if let Some(value) = file.stop_sequences {
+            self.stop_sequences = value;
+        }
+        if let Some(value) = file.tui {
+            self.tui = value;
+        }
+        if let Some(value) = file.full_system_access {
+            self.full_system_access = value;
+        }
+        if let Some(value) = file.banner_title {
+            self.banner_title = value;
+        }
+        if let Some(value) = file.banner_subtitle {
+            self.banner_subtitle = value;
+        }
+        if let Some(value) = file.banner_tip {
+            self.banner_tip = value;
+        }
+        if let Some(value) = file.banner_onboarding {
+            self.banner_onboarding = value;
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        self.model.as_deref().expect("model is resolved")
+    }
+
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_deref().expect("base_url is resolved")
+    }
+
+    pub fn show_thinking(&self) -> bool {
+        !self.hide_thinking
+    }
+
+    pub fn shell_permission(&self) -> PermissionMode {
+        if self.full_system_access || self.dangerously_allow_shell {
+            PermissionMode::Allow
+        } else {
+            self.shell_approval.unwrap_or(self.approval_mode)
+        }
+    }
+
+    pub fn write_permission(&self) -> PermissionMode {
+        if self.full_system_access || self.auto_write {
+            PermissionMode::Allow
+        } else {
+            self.write_approval.unwrap_or(self.approval_mode)
+        }
+    }
+
+    pub fn access_label(&self) -> &'static str {
+        if self.full_system_access {
+            "full-system"
+        } else {
+            "workspace"
+        }
+    }
+
+    pub fn banner_onboarding(&self) -> Vec<String> {
+        if self.banner_onboarding.is_empty() {
+            vec![
+                "/help commands".to_string(),
+                "/models local models".to_string(),
+                "/permissions safety".to_string(),
+                "/terminal real shell".to_string(),
+                "/exit quit".to_string(),
+            ]
+        } else {
+            self.banner_onboarding.clone()
+        }
+    }
+
+    pub fn effective_max_tool_rounds(&self) -> usize {
+        if self.autonomous {
+            self.max_tool_rounds.max(50)
+        } else {
+            self.max_tool_rounds
+        }
+    }
+
+    async fn finish_resolve(mut self) -> Result<Self> {
         self.workspace = self.workspace.canonicalize().map_err(|err| {
             anyhow!(
                 "workspace '{}' is not accessible: {err}",
@@ -162,56 +360,6 @@ impl Config {
         }
 
         Ok(self)
-    }
-
-    pub fn model(&self) -> &str {
-        self.model.as_deref().expect("model is resolved")
-    }
-
-    pub fn base_url(&self) -> &str {
-        self.base_url.as_deref().expect("base_url is resolved")
-    }
-
-    pub fn show_thinking(&self) -> bool {
-        !self.hide_thinking
-    }
-
-    pub fn shell_permission(&self) -> PermissionMode {
-        if self.full_system_access || self.dangerously_allow_shell {
-            PermissionMode::Allow
-        } else {
-            self.shell_approval.unwrap_or(self.approval_mode)
-        }
-    }
-
-    pub fn write_permission(&self) -> PermissionMode {
-        if self.full_system_access || self.auto_write {
-            PermissionMode::Allow
-        } else {
-            self.write_approval.unwrap_or(self.approval_mode)
-        }
-    }
-
-    pub fn access_label(&self) -> &'static str {
-        if self.full_system_access {
-            "full-system"
-        } else {
-            "workspace"
-        }
-    }
-
-    pub fn banner_onboarding(&self) -> Vec<String> {
-        if self.banner_onboarding.is_empty() {
-            vec![
-                "/help commands".to_string(),
-                "/models local models".to_string(),
-                "/permissions safety".to_string(),
-                "/terminal real shell".to_string(),
-                "/exit quit".to_string(),
-            ]
-        } else {
-            self.banner_onboarding.clone()
-        }
     }
 }
 
