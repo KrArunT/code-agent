@@ -101,9 +101,9 @@ The installed binary is named `autofix`.
 
 The agent reads `autofix_config.json` from the current working directory when it starts, if the file exists. It also watches that file’s modified time and auto-reloads the saved config before the next prompt or tool round when the file changes. Use `/config reload` for an explicit refresh.
 
-The included [`autofix_config.json`](autofix_config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, the autonomy toggle, and `auto_worktree`.
+The included [`autofix_config.json`](autofix_config.json) is a starter profile you can edit for future runs. It is a plain JSON file with the same core fields as the CLI: provider, workspace, permissions, thinking mode, banner text, onboarding lines, the autonomy toggle, `auto_worktree`, and the tool-loop budget controls.
 
-Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. The agent still stops at a finite safety cap, but the cap is much higher than the default interactive mode.
+Set `"autonomous": true` to raise the tool-loop budget for hands-off execution. Set `"unlimited_tool_rounds": true` when you want the loop to keep going until the model explicitly returns `final`, `blocked`, or `needs_worker`.
 
 ## Session History
 

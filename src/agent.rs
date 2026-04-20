@@ -1126,7 +1126,7 @@ impl Agent {
     async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
         match arg {
             "" | "show" => Ok(format!(
-                "config file: {}\nloaded: {}\nrole={:?}\nprovider={:?}\nmodel={}\nworkspace={}\nsession_id={}\nresume_session={}\ntask_file={}\nworker_id={}\nworker_name={}\nautonomous={}\nauto_worktree={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
+                "config file: {}\nloaded: {}\nrole={:?}\nprovider={:?}\nmodel={}\nworkspace={}\nsession_id={}\nresume_session={}\ntask_file={}\nworker_id={}\nworker_name={}\nautonomous={}\nauto_worktree={}\nunlimited_tool_rounds={}\nmax_tool_rounds={}\nmemory_file={}\nskills_dir={}\nactive_skills={}",
                 self.config.config_file.display(),
                 if self.config.config_file_exists() {
                     "yes"
@@ -1154,7 +1154,11 @@ impl Agent {
                 self.config.worker_name.as_deref().unwrap_or("none"),
                 self.config.autonomous,
                 self.config.auto_worktree,
-                self.config.effective_max_tool_rounds(),
+                self.config.unlimited_tool_rounds(),
+                match self.config.effective_max_tool_rounds() {
+                    Some(value) => value.to_string(),
+                    None => "inf".to_string(),
+                },
                 self.config.memory_file().display(),
                 self.config.skills_dir().display(),
                 self.config.active_skills().join(", ")
@@ -2043,20 +2047,31 @@ impl Agent {
     async fn respond(&mut self) -> Result<()> {
         let total_rounds = self.config.effective_max_tool_rounds();
         let mut warned_near_limit = false;
-        for round in 0..=total_rounds {
-            self.maybe_reload_config_if_changed().await?;
-            if !warned_near_limit && round >= total_rounds.saturating_sub(1) {
-                self.messages.push(Message {
-                    role: Role::System,
-                    content: "You are close to the tool budget limit. Prefer one of these outcomes now: return a final JSON turn, return a blocked JSON turn, or delegate remaining work to a worker. Use the Codex-style turn protocol and do not keep making exploratory tool calls unless they are essential.".to_string(),
-                });
-                warned_near_limit = true;
+        let mut round = 0usize;
+        loop {
+            if let Some(total_rounds) = total_rounds {
+                if round > total_rounds {
+                    self.set_progress("stopped after max tool rounds");
+                    ui::error("stopped after max tool rounds");
+                    break Ok(());
+                }
             }
-            self.set_progress(format!(
-                "round {}/{}: thinking",
-                round + 1,
-                total_rounds + 1
-            ));
+            self.maybe_reload_config_if_changed().await?;
+            if let Some(total_rounds) = total_rounds {
+                if !warned_near_limit && round >= total_rounds.saturating_sub(1) {
+                    self.messages.push(Message {
+                        role: Role::System,
+                        content: "You are close to the tool budget limit. Prefer one of these outcomes now: return a final JSON turn, return a blocked JSON turn, or delegate remaining work to a worker. Use the Codex-style turn protocol and do not keep making exploratory tool calls unless they are essential.".to_string(),
+                    });
+                    warned_near_limit = true;
+                }
+            }
+            self.set_progress(match total_rounds {
+                Some(total_rounds) => {
+                    format!("round {}/{}: thinking", round + 1, total_rounds + 1)
+                }
+                None => format!("round {}: thinking", round + 1),
+            });
             self.reset_interrupt_flag();
             let interrupt_watcher = self.spawn_interrupt_watcher();
             ui::assistant_start()?;
@@ -2157,14 +2172,23 @@ impl Agent {
                     let mut result_lines = Vec::new();
                     for (index, tool_call) in tool_calls.into_iter().enumerate() {
                         let tool_label = tool_call.summary();
-                        self.set_progress(format!(
-                            "round {}/{}: executing {} ({}/{})",
-                            round + 1,
-                            total_rounds + 1,
-                            tool_label,
-                            index + 1,
-                            tool_total
-                        ));
+                        self.set_progress(match total_rounds {
+                            Some(total_rounds) => format!(
+                                "round {}/{}: executing {} ({}/{})",
+                                round + 1,
+                                total_rounds + 1,
+                                tool_label,
+                                index + 1,
+                                tool_total
+                            ),
+                            None => format!(
+                                "round {}: executing {} ({}/{})",
+                                round + 1,
+                                tool_label,
+                                index + 1,
+                                tool_total
+                            ),
+                        });
                         ui::tool_start(&tool_label);
                         let result = match self.execute_tool_call(tool_call).await {
                             Ok(result) => result,
@@ -2182,7 +2206,6 @@ impl Agent {
                         role: Role::User,
                         content: format!("Tool result:\n{result}"),
                     });
-                    continue;
                 }
                 None => {
                     let tool_calls = match extract_tool_calls(&answer) {
@@ -2208,14 +2231,23 @@ impl Agent {
                     let mut result_lines = Vec::new();
                     for (index, tool_call) in tool_calls.into_iter().enumerate() {
                         let tool_label = tool_call.summary();
-                        self.set_progress(format!(
-                            "round {}/{}: executing {} ({}/{})",
-                            round + 1,
-                            total_rounds + 1,
-                            tool_label,
-                            index + 1,
-                            tool_total
-                        ));
+                        self.set_progress(match total_rounds {
+                            Some(total_rounds) => format!(
+                                "round {}/{}: executing {} ({}/{})",
+                                round + 1,
+                                total_rounds + 1,
+                                tool_label,
+                                index + 1,
+                                tool_total
+                            ),
+                            None => format!(
+                                "round {}: executing {} ({}/{})",
+                                round + 1,
+                                tool_label,
+                                index + 1,
+                                tool_total
+                            ),
+                        });
                         ui::tool_start(&tool_label);
                         let result = match self.execute_tool_call(tool_call).await {
                             Ok(result) => result,
@@ -2235,11 +2267,8 @@ impl Agent {
                     });
                 }
             }
+            round = round.saturating_add(1);
         }
-
-        self.set_progress("stopped after max tool rounds");
-        ui::error("stopped after max tool rounds");
-        Ok(())
     }
 
     async fn execute_tool_call(&mut self, call: ToolCall) -> Result<String> {

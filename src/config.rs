@@ -110,6 +110,9 @@ pub struct Config {
     #[arg(long, env = "AGENT_MAX_TOOL_ROUNDS", default_value_t = 6)]
     pub max_tool_rounds: usize,
 
+    #[arg(long, env = "AGENT_UNLIMITED_TOOL_ROUNDS")]
+    pub unlimited_tool_rounds: bool,
+
     #[arg(long, env = "AGENT_AUTONOMOUS")]
     pub autonomous: bool,
 
@@ -174,6 +177,7 @@ pub struct ConfigFile {
     pub shell_approval: Option<PermissionMode>,
     pub write_approval: Option<PermissionMode>,
     pub max_tool_rounds: Option<usize>,
+    pub unlimited_tool_rounds: Option<bool>,
     pub autonomous: Option<bool>,
     pub think: Option<ThinkMode>,
     pub hide_thinking: Option<bool>,
@@ -303,6 +307,9 @@ impl Config {
         if let Some(value) = file.max_tool_rounds {
             self.max_tool_rounds = value;
         }
+        if let Some(value) = file.unlimited_tool_rounds {
+            self.unlimited_tool_rounds = value;
+        }
         if let Some(value) = file.autonomous {
             self.autonomous = value;
         }
@@ -393,11 +400,17 @@ impl Config {
         }
     }
 
-    pub fn effective_max_tool_rounds(&self) -> usize {
-        if self.autonomous {
-            self.max_tool_rounds.max(50)
+    pub fn unlimited_tool_rounds(&self) -> bool {
+        self.unlimited_tool_rounds
+    }
+
+    pub fn effective_max_tool_rounds(&self) -> Option<usize> {
+        if self.unlimited_tool_rounds {
+            None
+        } else if self.autonomous {
+            Some(self.max_tool_rounds.max(50))
         } else {
-            self.max_tool_rounds
+            Some(self.max_tool_rounds)
         }
     }
 
@@ -439,6 +452,7 @@ impl Config {
             shell_approval: self.shell_approval,
             write_approval: self.write_approval,
             max_tool_rounds: Some(self.max_tool_rounds),
+            unlimited_tool_rounds: Some(self.unlimited_tool_rounds),
             autonomous: Some(self.autonomous),
             think: Some(self.think),
             hide_thinking: Some(self.hide_thinking),
@@ -500,6 +514,7 @@ impl Config {
             self.tui = false;
             self.auto_worktree = false;
             self.autonomous = true;
+            self.unlimited_tool_rounds = false;
             self.full_system_access = false;
             self.dangerously_allow_shell = false;
             self.auto_write = false;
@@ -666,5 +681,12 @@ mod tests {
             .expect("failed to inspect config time")
             .expect("expected legacy config time");
         assert!(modified <= SystemTime::now());
+    }
+
+    #[test]
+    fn unlimited_tool_rounds_disables_effective_cap() {
+        let config = Config::parse_from(["autofix", "--unlimited-tool-rounds"]);
+        assert!(config.unlimited_tool_rounds());
+        assert_eq!(config.effective_max_tool_rounds(), None);
     }
 }
