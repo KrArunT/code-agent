@@ -2,7 +2,28 @@
 
 A Rust terminal coding agent with local-first Ollama support, streaming output, workspace tools, approval controls, shell modes, and multiple LLM provider adapters.
 
-## Features
+## Quick Map
+
+- [Build](#build)
+- [Docs](#docs)
+- [Install](#install)
+- [Config](#config)
+- [Session History](#session-history)
+- [Session Interruption](#session-interruption)
+- [Memory And Skills](#memory-and-skills)
+- [Memory Strategy](#memory-strategy)
+- [Worktrees](#worktrees)
+- [Workers](#workers)
+- [Quick Start](#quick-start)
+- [Banner](#banner)
+- [Providers](#providers)
+- [System Prompt](#system-prompt)
+- [Commands](#commands)
+- [Approval Modes](#approval-modes)
+- [Agent Tool Calls](#agent-tool-calls)
+- [Notes](#notes)
+
+## Highlights
 
 - Local Ollama by default, with model discovery from `/api/tags`.
 - Provider adapters for OpenAI-compatible APIs, Anthropic, Gemini, OpenRouter, Ollama, and custom OpenAI-compatible gateways.
@@ -24,11 +45,41 @@ A Rust terminal coding agent with local-first Ollama support, streaming output, 
 - Shell runner mode plus full terminal passthrough mode.
 - Ollama thinking controls and stop sequences.
 
+## Common Workflows
+
+- Start the agent: `cargo run`
+- Resume a previous task: `cargo run -- --resume-session <session-id>`
+- Interrupt a long response: `/interrupt` or `Ctrl-C`
+- Inspect live state: `/session`, `/history`, `/provider`, `/memory`, `/skills`
+- Isolate feature work: `/worktree auto` or `/agents spawn <name> | <task>`
+- Build docs: `./scripts/build-docs.sh`
+
 ## Build
 
 ```bash
 cargo build
 ```
+
+## Docs
+
+Build HTML and PDF documentation from the README with Pandoc:
+
+```bash
+./scripts/build-docs.sh
+```
+
+By default the script writes:
+
+- `docs/build/AutoFix.html`
+- `docs/build/AutoFix.pdf`
+
+If you want a different source file or output directory, override the script inputs:
+
+```bash
+DOC_SOURCE=README.md DOC_TITLE=autofix OUT_DIR=docs/build ./scripts/build-docs.sh
+```
+
+The script expects `pandoc` and a LaTeX engine such as `xelatex` to be installed locally. The repo does not vendor those tools.
 
 ## Install
 
@@ -78,6 +129,24 @@ cargo run -- --resume-session <session-id>
 
 `/session resume <id>` also switches the live process to a new session cloned from the saved one, so you can continue immediately and keep the old record intact.
 
+### Session Interruption
+
+You can stop an active model stream and keep the current session state with either:
+
+```text
+/interrupt
+Ctrl-C
+```
+
+When interrupted, the agent:
+
+- stops the in-flight model request
+- saves the current session record
+- writes an interruption note into `PLAN.md`
+- leaves the current session resumable through `/session resume <id>` or `--resume-session <id>`
+
+This is the right way to pause long backports, large refactors, or work that should be picked up later without losing the current command history.
+
 ## Memory And Skills
 
 The agent loads `memory.json` and the `skills/` directory from the workspace on startup. These are merged into the system prompt so repeated context can stay out of the chat transcript.
@@ -110,6 +179,33 @@ Use `/skills` to inspect or switch active skills:
 ```
 
 The active skill list is stored in `autofix_config.json` under `active_skills`, and `/config reload` re-reads `autofix_config.json`, `memory.json`, and the active skills without restarting the agent.
+
+### Memory Strategy
+
+The current design keeps memory simple and deterministic:
+
+- `memory.json` stores durable notes that should survive across runs.
+- `PLAN.md` stores live session state, summary, files changed, and next steps.
+- `AGENT.md` stores repo-local operating rules.
+- `skills/` stores reusable task-specific instruction blocks.
+- `sessions/` stores command history and resumable message snapshots.
+
+For this repo, that is usually enough.
+
+You do **not** need a vector database yet if the goal is:
+
+- remembering the active task
+- carrying forward local instructions
+- resuming recent sessions
+- keeping worktree-local context isolated
+
+A vector database becomes useful when you need semantic recall over a large corpus of past tasks, logs, patches, or external documents. Until then, a simple index is lower risk and easier to debug.
+
+Recommended next step if memory grows:
+
+- add a lightweight keyword or tag index over `memory.json`, `PLAN.md`, and session summaries
+- keep the raw source files as the source of truth
+- add embeddings/vector search only after the keyword index becomes too weak for retrieval
 
 ## Worktrees
 

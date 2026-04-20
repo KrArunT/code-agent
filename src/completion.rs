@@ -23,6 +23,7 @@ const COMMANDS: &[&str] = &[
     "/help",
     "/hide-thinking",
     "/history",
+    "/interrupt",
     "/list",
     "/memory",
     "/models",

@@ -3,6 +3,11 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,17 +63,32 @@ impl ProviderClient {
         }
     }
 
-    pub async fn complete_stream<F>(&self, messages: &[Message], mut on_delta: F) -> Result<String>
+    pub async fn complete_stream<F>(
+        &self,
+        messages: &[Message],
+        interrupt_requested: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String>
     where
         F: FnMut(StreamEvent<'_>) -> Result<()>,
     {
         match self.kind {
             ProviderKind::Openai | ProviderKind::Openrouter | ProviderKind::CustomOpenai => {
-                self.openai_compatible_stream(messages, &mut on_delta).await
+                self.openai_compatible_stream(messages, interrupt_requested, &mut on_delta)
+                    .await
             }
-            ProviderKind::Anthropic => self.anthropic_stream(messages, &mut on_delta).await,
-            ProviderKind::Gemini => self.gemini_stream(messages, &mut on_delta).await,
-            ProviderKind::Ollama => self.ollama_stream(messages, &mut on_delta).await,
+            ProviderKind::Anthropic => {
+                self.anthropic_stream(messages, interrupt_requested, &mut on_delta)
+                    .await
+            }
+            ProviderKind::Gemini => {
+                self.gemini_stream(messages, interrupt_requested, &mut on_delta)
+                    .await
+            }
+            ProviderKind::Ollama => {
+                self.ollama_stream(messages, interrupt_requested, &mut on_delta)
+                    .await
+            }
         }
     }
 
@@ -137,6 +157,7 @@ impl ProviderClient {
     async fn openai_compatible_stream<F>(
         &self,
         messages: &[Message],
+        interrupt_requested: Arc<AtomicBool>,
         on_delta: &mut F,
     ) -> Result<String>
     where
@@ -170,7 +191,7 @@ impl ProviderClient {
             .error_for_status()
             .context("provider streaming request returned an error")?;
 
-        collect_line_stream(response, |line, answer| {
+        collect_line_stream(response, interrupt_requested, |line, answer| {
             let Some(data) = line.strip_prefix("data:") else {
                 return Ok(false);
             };
@@ -251,7 +272,12 @@ impl ProviderClient {
             .ok_or_else(|| anyhow!("unexpected Anthropic response: {value}"))
     }
 
-    async fn anthropic_stream<F>(&self, messages: &[Message], on_delta: &mut F) -> Result<String>
+    async fn anthropic_stream<F>(
+        &self,
+        messages: &[Message],
+        interrupt_requested: Arc<AtomicBool>,
+        on_delta: &mut F,
+    ) -> Result<String>
     where
         F: FnMut(StreamEvent<'_>) -> Result<()>,
     {
@@ -297,7 +323,7 @@ impl ProviderClient {
             .error_for_status()
             .context("Anthropic streaming request returned an error")?;
 
-        collect_line_stream(response, |line, answer| {
+        collect_line_stream(response, interrupt_requested, |line, answer| {
             let Some(data) = line.strip_prefix("data:") else {
                 return Ok(false);
             };
@@ -367,7 +393,12 @@ impl ProviderClient {
             .ok_or_else(|| anyhow!("unexpected Gemini response: {value}"))
     }
 
-    async fn gemini_stream<F>(&self, messages: &[Message], on_delta: &mut F) -> Result<String>
+    async fn gemini_stream<F>(
+        &self,
+        messages: &[Message],
+        interrupt_requested: Arc<AtomicBool>,
+        on_delta: &mut F,
+    ) -> Result<String>
     where
         F: FnMut(StreamEvent<'_>) -> Result<()>,
     {
@@ -401,7 +432,7 @@ impl ProviderClient {
             .error_for_status()
             .context("Gemini streaming request returned an error")?;
 
-        collect_line_stream(response, |line, answer| {
+        collect_line_stream(response, interrupt_requested, |line, answer| {
             let Some(data) = line.strip_prefix("data:") else {
                 return Ok(false);
             };
@@ -455,7 +486,12 @@ impl ProviderClient {
             .ok_or_else(|| anyhow!("unexpected Ollama response: {value}"))
     }
 
-    async fn ollama_stream<F>(&self, messages: &[Message], on_delta: &mut F) -> Result<String>
+    async fn ollama_stream<F>(
+        &self,
+        messages: &[Message],
+        interrupt_requested: Arc<AtomicBool>,
+        on_delta: &mut F,
+    ) -> Result<String>
     where
         F: FnMut(StreamEvent<'_>) -> Result<()>,
     {
@@ -479,7 +515,7 @@ impl ProviderClient {
             .error_for_status()
             .context("Ollama streaming request returned an error")?;
 
-        collect_line_stream(response, |line, answer| {
+        collect_line_stream(response, interrupt_requested, |line, answer| {
             if line.trim().is_empty() {
                 return Ok(false);
             }
@@ -527,6 +563,7 @@ impl ProviderClient {
 
 async fn collect_line_stream<F>(
     mut response: reqwest::Response,
+    interrupt_requested: Arc<AtomicBool>,
     mut handle_line: F,
 ) -> Result<String>
 where
@@ -535,11 +572,21 @@ where
     let mut answer = String::new();
     let mut buffered = String::new();
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("failed to read streaming chunk")?
-    {
+    loop {
+        if interrupt_requested.load(Ordering::SeqCst) {
+            return Err(anyhow!("interrupted by user"));
+        }
+
+        let chunk = match timeout(Duration::from_millis(100), response.chunk()).await {
+            Ok(chunk) => chunk.context("failed to read streaming chunk")?,
+            Err(_) => {
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+
         buffered.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(newline) = buffered.find('\n') {
             let line = buffered[..newline].trim_end_matches('\r').to_string();

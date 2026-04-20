@@ -333,6 +333,7 @@ pub fn help_text() -> &'static str {
   /session new       start a fresh session
   /session resume <id> resume a saved session into a fresh current session
   /history           show current command history
+  /interrupt         stop the active model stream and save the interrupted session
   /provider          show provider configuration
   /permissions       show shell/write approval modes
   /permissions ask   ask before shell commands and file writes

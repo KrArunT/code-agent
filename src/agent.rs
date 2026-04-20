@@ -47,6 +47,7 @@ use std::{
     io::{self, Stdout},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -64,6 +65,8 @@ pub struct Agent {
     completion_workspace: Arc<Mutex<PathBuf>>,
     progress: String,
     session_dirty: bool,
+    session_interrupt: Arc<AtomicBool>,
+    response_interrupted: bool,
 }
 
 const MAX_TUI_HISTORY: usize = 400;
@@ -101,6 +104,8 @@ impl Agent {
             completion_workspace: Arc::new(Mutex::new(completion_workspace)),
             progress: String::new(),
             session_dirty: false,
+            session_interrupt: Arc::new(AtomicBool::new(false)),
+            response_interrupted: false,
         })
     }
 
@@ -108,6 +113,7 @@ impl Agent {
         self.ensure_auto_worktree().await?;
         self.update_plan_file("startup").await?;
         self.persist_session_state()?;
+        self.reset_interrupt_flag();
         ui::banner(
             &self.config.banner_title,
             &self.config.banner_subtitle,
@@ -175,9 +181,14 @@ impl Agent {
                 content: user_prompt,
             });
             self.sync_session_messages()?;
+            self.reset_response_interrupted();
             self.respond().await?;
             self.sync_session_messages()?;
-            self.update_plan_file("response").await?;
+            if self.response_interrupted {
+                self.update_plan_file("interrupted").await?;
+            } else {
+                self.update_plan_file("response").await?;
+            }
             self.clear_progress();
         }
         Ok(())
@@ -261,6 +272,7 @@ impl Agent {
         self.ensure_auto_worktree().await?;
         self.update_plan_file("startup").await?;
         self.persist_session_state()?;
+        self.reset_interrupt_flag();
         let mut terminal = TuiGuard::enter()?;
         let banner_onboarding = self.config.banner_onboarding();
         let mut transcript = vec![TranscriptItem::new(
@@ -419,6 +431,7 @@ impl Agent {
                                 content: user_prompt,
                             });
                             self.sync_session_messages()?;
+                            self.reset_response_interrupted();
 
                             status = "streaming".to_string();
                             transcript.push(TranscriptItem::new("assistant", String::new()));
@@ -434,40 +447,70 @@ impl Agent {
                                 scroll_offset,
                             )?;
 
+                            self.reset_interrupt_flag();
+                            let interrupt_watcher = self.spawn_interrupt_watcher();
                             let mut inline_thinking = false;
                             let mut visible_answer = String::new();
                             let show_thinking = self.config.show_thinking()
                                 && !matches!(self.provider.think(), ThinkMode::Off);
                             let answer = self
                                 .provider
-                                .complete_stream(&self.messages, |event| {
-                                    match event {
-                                        StreamEvent::Content(delta) => {
-                                            visible_answer.push_str(&filter_tui_content_delta(
-                                                delta,
-                                                show_thinking,
-                                                &mut inline_thinking,
-                                            ));
-                                        }
-                                        StreamEvent::Thinking(delta) => {
-                                            if show_thinking {
-                                                visible_answer.push_str(delta);
+                                .complete_stream(
+                                    &self.messages,
+                                    self.session_interrupt.clone(),
+                                    |event| {
+                                        match event {
+                                            StreamEvent::Content(delta) => {
+                                                visible_answer.push_str(&filter_tui_content_delta(
+                                                    delta,
+                                                    show_thinking,
+                                                    &mut inline_thinking,
+                                                ));
+                                            }
+                                            StreamEvent::Thinking(delta) => {
+                                                if show_thinking {
+                                                    visible_answer.push_str(delta);
+                                                }
                                             }
                                         }
-                                    }
-                                    transcript[assistant_index].content = visible_answer.clone();
-                                    draw_tui(
-                                        terminal.inner(),
-                                        self,
-                                        &transcript,
-                                        &input,
-                                        &status,
-                                        show_help,
-                                        scroll_offset,
-                                    )?;
-                                    Ok(())
-                                })
-                                .await?;
+                                        transcript[assistant_index].content =
+                                            visible_answer.clone();
+                                        draw_tui(
+                                            terminal.inner(),
+                                            self,
+                                            &transcript,
+                                            &input,
+                                            &status,
+                                            show_help,
+                                            scroll_offset,
+                                        )?;
+                                        Ok(())
+                                    },
+                                )
+                                .await;
+                            interrupt_watcher.abort();
+                            let answer = match answer {
+                                Ok(answer) => answer,
+                                Err(err) if err.to_string().contains("interrupted by user") => {
+                                    transcript[assistant_index].content = visible_answer;
+                                    transcript.push(TranscriptItem::new(
+                                        "system",
+                                        "session interrupted by the user before completion",
+                                    ));
+                                    self.messages.push(Message {
+                                        role: Role::System,
+                                        content: "Session interrupted by the user before completion. Preserve the current state and continue from the saved session when resumed.".to_string(),
+                                    });
+                                    self.sync_session_messages()?;
+                                    status = "interrupted".to_string();
+                                    self.response_interrupted = true;
+                                    self.update_plan_file("interrupted").await?;
+                                    self.clear_progress();
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                Err(err) => return Err(err),
+                            };
                             let answer = strip_think_blocks(&answer);
                             transcript[assistant_index].content = answer.clone();
                             self.messages.push(Message {
@@ -577,6 +620,11 @@ impl Agent {
             }
             "/stop" => {
                 self.handle_stop_sequences(arg);
+                Ok(false)
+            }
+            "/interrupt" => {
+                self.request_interrupt();
+                ui::info("interrupt requested");
                 Ok(false)
             }
             "/models" => {
@@ -851,6 +899,11 @@ impl Agent {
                         )),
                     },
                 }
+                Ok(false)
+            }
+            "/interrupt" => {
+                self.request_interrupt();
+                transcript.push(TranscriptItem::new("system", "interrupt requested"));
                 Ok(false)
             }
             _ => {
@@ -1432,6 +1485,26 @@ impl Agent {
         save_session_record(&self.config.workspace, &self.session)
     }
 
+    fn reset_interrupt_flag(&self) {
+        self.session_interrupt.store(false, Ordering::SeqCst);
+    }
+
+    fn reset_response_interrupted(&mut self) {
+        self.response_interrupted = false;
+    }
+
+    fn request_interrupt(&self) {
+        self.session_interrupt.store(true, Ordering::SeqCst);
+    }
+
+    fn spawn_interrupt_watcher(&self) -> tokio::task::JoinHandle<()> {
+        let interrupt = self.session_interrupt.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            interrupt.store(true, Ordering::SeqCst);
+        })
+    }
+
     fn load_editor_history(
         &self,
         editor: &mut Editor<AgentCompleter, DefaultHistory>,
@@ -1816,6 +1889,8 @@ impl Agent {
                 round + 1,
                 total_rounds + 1
             ));
+            self.reset_interrupt_flag();
+            let interrupt_watcher = self.spawn_interrupt_watcher();
             ui::assistant_start()?;
             let mut showed_thinking = false;
             let mut showed_answer = false;
@@ -1825,7 +1900,7 @@ impl Agent {
                 self.config.show_thinking() && !matches!(self.provider.think(), ThinkMode::Off);
             let answer = self
                 .provider
-                .complete_stream(&self.messages, |event| {
+                .complete_stream(&self.messages, self.session_interrupt.clone(), |event| {
                     match event {
                         StreamEvent::Content(delta) => {
                             stream_content_delta(
@@ -1849,7 +1924,25 @@ impl Agent {
                     }
                     Ok(())
                 })
-                .await?;
+                .await;
+            interrupt_watcher.abort();
+            let answer = match answer {
+                Ok(answer) => answer,
+                Err(err) if err.to_string().contains("interrupted by user") => {
+                    self.set_progress("interrupted");
+                    ui::error("session interrupted");
+                    self.messages.push(Message {
+                        role: Role::System,
+                        content: "Session interrupted by the user before completion. Preserve the current state and continue from the saved session when resumed.".to_string(),
+                    });
+                    self.sync_session_messages()?;
+                    self.response_interrupted = true;
+                    let _ = self.update_plan_file("interrupted").await;
+                    self.clear_progress();
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
             markdown.finish()?;
             if showed_thinking && !showed_answer {
                 ui::stream_reset()?;
@@ -2901,7 +2994,7 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nUse default line mode for the full command surface while this TUI is iterating."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /interrupt\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nCtrl-C interrupts the active model stream and saves the session."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
