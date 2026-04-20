@@ -38,7 +38,7 @@ pub fn banner(
         println!("{BOLD}{RED}warning>{RESET} full system access is enabled: absolute paths, path escapes, shell, and writes are allowed");
     }
     if onboarding.is_empty() {
-        println!("{BOLD}{YELLOW}onboarding>{RESET} /help commands  /models local models  /permissions safety  /terminal real shell  /exit quit");
+        println!("{BOLD}{YELLOW}onboarding>{RESET} /help commands  /models local models  /search web search  /permissions safety  /terminal real shell  /exit quit");
     } else {
         for (idx, line) in onboarding.iter().enumerate() {
             if idx == 0 {
@@ -359,6 +359,7 @@ pub fn help_text() -> &'static str {
   /attach image <path> append an image reference to the next prompt
   /attach show       show queued prompt attachments
   /attach clear      clear queued prompt attachments
+  /search <query>    search the web with DuckDuckGo
   /shell             enter shell mode
   /shell <command>   run one shell command with confirmation
   !<command>         run one shell command from chat mode

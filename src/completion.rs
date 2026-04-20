@@ -30,6 +30,7 @@ const COMMANDS: &[&str] = &[
     "/permissions",
     "/provider",
     "/read",
+    "/search",
     "/agents",
     "/attach",
     "/shell",

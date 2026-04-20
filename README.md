@@ -386,7 +386,7 @@ cargo run -- --system "$(cat system-prompt.txt)"
 Press `Tab` to complete slash commands and workspace paths.
 
 The default line-mode UI supports the full command set below. The `--tui` full-screen mode currently supports chat plus `/help`, `/provider`, `/models`, `/use-model`, `/thinking`, `/clear`, and `/exit`; line mode remains available for shell, terminal passthrough, writes, and the full command surface while the Ratatui path is iterating.
-Both modes start with an onboarding block that points you at `/help`, `/models`, `/permissions`, `/terminal`, and the backporting workflow.
+Both modes start with an onboarding block that points you at `/help`, `/models`, `/search`, `/permissions`, `/terminal`, and the backporting workflow.
 
 TUI navigation:
 
@@ -398,74 +398,58 @@ TUI navigation:
 - Drag or click the scrollbar to reposition the transcript.
 - The bottom hint line shows the current shortcut summary inside the full-screen UI.
 
-Core commands:
-
-- `/help` shows command help.
-- `/provider` shows provider, model, thinking, stop, and permission state.
-- `/models` lists installed Ollama models.
-- `/use-model <name>` switches to an installed Ollama model.
-- `/clear` clears and redraws the terminal header.
-- `/exit` exits.
-
-Workspace commands:
-
-- `/list [path]` lists files under the workspace.
-- `/read <path>` prints a file.
-- `/write <path>` writes content until a line containing only `.`.
-- `/config` shows the current config file state.
-- `/config reload` reloads `autofix_config.json` from disk.
-- `/session` shows the active session state.
-- `/session list` lists saved sessions.
-- `/session history` shows the active command history.
-- `/session save` persists the active session record.
-- `/session new` starts a fresh session.
-- `/session resume <id>` resumes a saved session into a fresh current session.
-- `/history` shows the active command history.
-- `/memory` shows and edits persistent memory notes.
-- `/skills` shows and edits active skills.
-- `/worktree` shows and edits git worktree state.
-- `/attach file <path>` queues a file to prepend to the next prompt.
-- `/attach image <path>` queues an image reference and metadata to prepend to the next prompt.
-- `/attach show` shows queued prompt attachments.
-- `/attach clear` clears queued prompt attachments.
-
-Shell commands:
-
-- `/shell` enters command-runner shell mode.
-- `/shell <command>` runs one command.
-- `!<command>` runs one shell command from chat mode.
-- `/chat` or `/exit-shell` leaves shell mode.
-- `/terminal` opens your real shell in the workspace.
-- `/terminal <shell>` opens a specific shell, for example `/terminal /bin/bash`.
-
-Permissions:
-
-- `/permissions` shows shell/write approval modes.
-- `/permissions ask` asks before shell commands and writes.
-- `/permissions allow` allows shell commands and writes.
-- `/permissions deny` denies shell commands and writes.
-- `/permissions shell <ask|allow|deny>` changes shell approval only.
-- `/permissions write <ask|allow|deny>` changes write approval only.
-
-Full system access:
-
-- `--full-system-access` enables broad local access.
-- In this mode, file tools can read/write absolute paths and paths outside the workspace.
-- Shell and write permissions are treated as `allow`.
-- Startup status and `/provider` show `access=full-system`.
-- The same access label appears in the Ratatui status panel and startup banner.
-
-Ollama thinking and stops:
-
-- `/thinking` shows thinking mode and trace visibility.
-- `/thinking off` asks Ollama to stop thinking for faster answers.
-- `/thinking on` asks Ollama to return thinking tokens.
-- `/thinking hide` hides thinking trace in the TUI.
-- `/thinking show` shows thinking trace in the TUI.
-- `/stop` shows stop sequences.
-- `/stop add <text>` adds a stop sequence.
-- `/stop set <a,b,c>` replaces stop sequences.
-- `/stop clear` clears stop sequences.
+| Area | Command | Purpose |
+| --- | --- | --- |
+| Core | `/help` | Show command help. |
+| Core | `/provider` | Show provider, model, thinking, stop, and permission state. |
+| Core | `/models` | List installed Ollama models. |
+| Core | `/use-model <name>` | Switch to an installed Ollama model. |
+| Core | `/clear` | Clear and redraw the terminal header. |
+| Core | `/exit` | Exit the agent. |
+| Workspace | `/list [path]` | List files under the workspace. |
+| Workspace | `/read <path>` | Print a file. |
+| Workspace | `/write <path>` | Write content until a line containing only `.`. |
+| Workspace | `/config` | Show the current config file state. |
+| Workspace | `/config reload` | Reload `autofix_config.json` from disk. |
+| Workspace | `/memory` | Show and edit persistent memory notes. |
+| Workspace | `/skills` | Show and edit active skills. |
+| Workspace | `/attach file <path>` | Queue a file to prepend to the next prompt. |
+| Workspace | `/attach image <path>` | Queue an image reference and metadata to prepend to the next prompt. |
+| Workspace | `/attach show` | Show queued prompt attachments. |
+| Workspace | `/attach clear` | Clear queued prompt attachments. |
+| Workspace | `/search <query>` | Search the web with DuckDuckGo and render compact results. |
+| Session | `/session` | Show the active session state. |
+| Session | `/session list` | List saved sessions. |
+| Session | `/session history` | Show the active command history. |
+| Session | `/session save` | Persist the active session record. |
+| Session | `/session new` | Start a fresh session. |
+| Session | `/session resume <id>` | Resume a saved session into a fresh current session. |
+| Session | `/history` | Show the active command history. |
+| Session | `/interrupt` | Stop the active model stream and save the interrupted session. |
+| Worktree | `/worktree` | Show and edit git worktree state. |
+| Shell | `/shell` | Enter command-runner shell mode. |
+| Shell | `/shell <command>` | Run one command. |
+| Shell | `!<command>` | Run one shell command from chat mode. |
+| Shell | `/chat` or `/exit-shell` | Leave shell mode. |
+| Shell | `/terminal` | Open your real shell in the workspace. |
+| Shell | `/terminal <shell>` | Open a specific shell, for example `/terminal /bin/bash`. |
+| Permissions | `/permissions` | Show shell/write approval modes. |
+| Permissions | `/permissions ask` | Ask before shell commands and writes. |
+| Permissions | `/permissions allow` | Allow shell commands and writes. |
+| Permissions | `/permissions deny` | Deny shell commands and writes. |
+| Permissions | `/permissions shell <ask|allow|deny>` | Change shell approval only. |
+| Permissions | `/permissions write <ask|allow|deny>` | Change write approval only. |
+| Access | `--full-system-access` | Enable broad local access and allow absolute/outside-workspace paths. |
+| Access | `/provider` or startup banner | Show `access=full-system` when full system access is enabled. |
+| Thinking | `/thinking` | Show thinking mode and trace visibility. |
+| Thinking | `/thinking off` | Ask Ollama to stop thinking for faster answers. |
+| Thinking | `/thinking on` | Ask Ollama to return thinking tokens. |
+| Thinking | `/thinking hide` | Hide thinking trace in the TUI. |
+| Thinking | `/thinking show` | Show thinking trace in the TUI. |
+| Thinking | `/stop` | Show stop sequences. |
+| Thinking | `/stop add <text>` | Add a stop sequence. |
+| Thinking | `/stop set <a,b,c>` | Replace stop sequences. |
+| Thinking | `/stop clear` | Clear stop sequences. |
 
 ## Approval Modes
 
@@ -508,6 +492,7 @@ Supported tools:
 - `read_file`: `{ "tool": "read_file", "path": "src/main.rs" }`
 - `write_file`: `{ "tool": "write_file", "path": "notes.txt", "content": "..." }`
 - `run_shell`: `{ "tool": "run_shell", "command": "cargo test" }`
+- `web_search`: `{ "tool": "web_search", "query": "linux kernel backporting", "max_results": 5 }`
 - `spawn_worker`: `{ "tool": "spawn_worker", "name": "parser", "task": "..." }`
 - `list_workers`: `{ "tool": "list_workers" }`
 - `read_worker`: `{ "tool": "read_worker", "id": "worker-id" }`
@@ -531,4 +516,5 @@ Supported control states:
 
 - `/shell` captures command output and feeds it through the TUI renderer.
 - `/terminal` hands control to a real shell with inherited terminal I/O, then returns when the shell exits.
+- `/search` uses DuckDuckGo HTML search results by default and returns compact title, URL, and snippet output.
 - Some Ollama thinking models may still emit inline `<think>...</think>` text. The TUI filters those blocks from conversation history and can hide them from display with `/thinking hide` or `--hide-thinking`.

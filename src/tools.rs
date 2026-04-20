@@ -1,5 +1,6 @@
 use crate::config::PermissionMode;
 use anyhow::{anyhow, Context, Result};
+use reqwest::Url;
 use serde::Deserialize;
 use std::{
     fs,
@@ -13,13 +14,31 @@ use walkdir::WalkDir;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case")]
 pub enum ToolCall {
-    ListFiles { path: Option<String> },
-    ReadFile { path: String },
-    WriteFile { path: String, content: String },
-    RunShell { command: String },
-    SpawnWorker { name: Option<String>, task: String },
+    ListFiles {
+        path: Option<String>,
+    },
+    ReadFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    RunShell {
+        command: String,
+    },
+    WebSearch {
+        query: String,
+        max_results: Option<usize>,
+    },
+    SpawnWorker {
+        name: Option<String>,
+        task: String,
+    },
     ListWorkers,
-    ReadWorker { id: String },
+    ReadWorker {
+        id: String,
+    },
 }
 
 impl ToolCall {
@@ -33,6 +52,11 @@ impl ToolCall {
                 format!("write_file path={path} bytes={}", content.len())
             }
             ToolCall::RunShell { command } => format!("run_shell command={command}"),
+            ToolCall::WebSearch { query, max_results } => format!(
+                "web_search query={} results={}",
+                query,
+                max_results.unwrap_or(5)
+            ),
             ToolCall::SpawnWorker { name, task } => format!(
                 "spawn_worker name={} task={}",
                 name.as_deref().unwrap_or("worker"),
@@ -92,6 +116,9 @@ impl ToolRuntime {
             ToolCall::ReadFile { path } => self.read_file(&path),
             ToolCall::WriteFile { path, content } => self.write_file(&path, &content),
             ToolCall::RunShell { command } => self.run_shell(&command).await,
+            ToolCall::WebSearch { query, max_results } => {
+                self.web_search(&query, max_results.unwrap_or(5)).await
+            }
             ToolCall::SpawnWorker { .. } | ToolCall::ListWorkers | ToolCall::ReadWorker { .. } => {
                 Err(anyhow!(
                     "agent orchestration tools must be handled by the master agent"
@@ -213,6 +240,45 @@ impl ToolRuntime {
         ))
     }
 
+    pub async fn web_search(&self, query: &str, max_results: usize) -> Result<String> {
+        let max_results = max_results.clamp(1, 8);
+        let url = Url::parse_with_params(
+            "https://html.duckduckgo.com/html/",
+            &[("q", query), ("kl", "us-en"), ("kp", "-1"), ("ia", "web")],
+        )
+        .context("failed to build DuckDuckGo search URL")?;
+
+        let html = reqwest::Client::new()
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "autofix/1.0 (+https://github.com/KrArunT/code-agent)",
+            )
+            .send()
+            .await
+            .context("DuckDuckGo search request failed")?
+            .error_for_status()
+            .context("DuckDuckGo returned an error")?
+            .text()
+            .await
+            .context("DuckDuckGo response was not text")?;
+
+        let results = parse_duckduckgo_results(&html, max_results);
+        if results.is_empty() {
+            return Ok(format!("no DuckDuckGo results found for `{query}`"));
+        }
+
+        let mut output = format!("DuckDuckGo results for `{query}`:\n");
+        for (index, result) in results.iter().enumerate() {
+            output.push_str(&format!("\n{}. {}\n", index + 1, result.title));
+            output.push_str(&format!("   {}\n", result.url));
+            if !result.snippet.trim().is_empty() {
+                output.push_str(&format!("   {}\n", result.snippet));
+            }
+        }
+        Ok(output.trim_end().to_string())
+    }
+
     fn safe_path(&self, path: &str) -> Result<PathBuf> {
         let requested = Path::new(path);
         if requested.is_absolute() {
@@ -233,6 +299,149 @@ impl ToolRuntime {
         }
         Ok(joined)
     }
+}
+
+#[derive(Debug, Clone)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn parse_duckduckgo_results(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut search_start = 0;
+
+    while results.len() < max_results {
+        let Some(marker) = html[search_start..].find("result__a") else {
+            break;
+        };
+        let anchor_hint = search_start + marker;
+        let Some(tag_start) = html[..anchor_hint].rfind("<a") else {
+            search_start = anchor_hint + "result__a".len();
+            continue;
+        };
+        let Some(tag_end_rel) = html[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel;
+        let open_tag = &html[tag_start..=tag_end];
+        if !open_tag.contains("result__a") {
+            search_start = tag_end + 1;
+            continue;
+        }
+
+        let Some(raw_href) = extract_attr(open_tag, "href") else {
+            search_start = tag_end + 1;
+            continue;
+        };
+        let Some(title_end_rel) = html[tag_end + 1..].find("</a>") else {
+            break;
+        };
+        let title_html = &html[tag_end + 1..tag_end + 1 + title_end_rel];
+        let title = html_to_text(title_html);
+        if title.is_empty() {
+            search_start = tag_end + 1;
+            continue;
+        }
+
+        let result_end = html[tag_end + 1 + title_end_rel..]
+            .find("result__a")
+            .map(|offset| tag_end + 1 + title_end_rel + offset)
+            .unwrap_or(html.len());
+        let block = &html[tag_end + 1 + title_end_rel..result_end];
+        let snippet = find_snippet(block).unwrap_or_default();
+        let url = normalize_duckduckgo_url(&raw_href);
+        results.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
+        search_start = tag_end + 1 + title_end_rel + 4;
+    }
+
+    results
+}
+
+fn find_snippet(block: &str) -> Option<String> {
+    let marker = block.find("result__snippet")?;
+    let tag_start = block[..marker].rfind('<')?;
+    let tag_end = block[tag_start..].find('>')? + tag_start;
+    let tag_name = block[tag_start + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .collect::<String>();
+    let closing = if tag_name.is_empty() {
+        block[tag_end + 1..].find("</")
+    } else {
+        block[tag_end + 1..].find(&format!("</{tag_name}"))
+    };
+    let end = closing.unwrap_or(block.len() - tag_end - 1);
+    let snippet = html_to_text(&block[tag_end + 1..tag_end + 1 + end]);
+    if snippet.trim().is_empty() {
+        None
+    } else {
+        Some(snippet)
+    }
+}
+
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!(r#"{attr}=""#);
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+fn normalize_duckduckgo_url(raw_href: &str) -> String {
+    let href = if raw_href.starts_with("//") {
+        format!("https:{raw_href}")
+    } else {
+        raw_href.to_string()
+    };
+
+    if let Ok(url) = Url::parse(&href) {
+        if let Some((_, value)) = url.query_pairs().find(|(name, _)| name == "uddg") {
+            return value.into_owned();
+        }
+    }
+
+    href
+}
+
+fn html_to_text(input: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' if !in_tag => {
+                let mut entity = String::from("&");
+                while let Some(next) = chars.peek().copied() {
+                    entity.push(next);
+                    chars.next();
+                    if next == ';' || entity.len() > 12 {
+                        break;
+                    }
+                }
+                output.push_str(match entity.as_str() {
+                    "&amp;" => "&",
+                    "&lt;" => "<",
+                    "&gt;" => ">",
+                    "&quot;" => "\"",
+                    "&#39;" => "'",
+                    "&#x27;" => "'",
+                    _ => entity.as_str(),
+                });
+            }
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 enum Approval {
@@ -261,4 +470,28 @@ fn confirm(question: &str) -> Result<bool> {
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_duckduckgo_results_from_html() {
+        let html = r#"
+<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fone">First &amp; Result</a>
+<span class="result__snippet">Snippet <b>one</b>.</span>
+<a class="result__a" href="https://example.com/two">Second Result</a>
+<div class="result__snippet">Snippet two.</div>
+"#;
+
+        let results = parse_duckduckgo_results(html, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "First & Result");
+        assert_eq!(results[0].url, "https://example.com/one");
+        assert_eq!(results[0].snippet, "Snippet one.");
+        assert_eq!(results[1].title, "Second Result");
+        assert_eq!(results[1].url, "https://example.com/two");
+        assert_eq!(results[1].snippet, "Snippet two.");
+    }
 }

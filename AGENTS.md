@@ -10,6 +10,7 @@ Legacy compatibility copy. The canonical file is [`AGENT.md`](AGENT.md).
 - Use isolated worker agents for side tasks that can live in their own worktree and context.
 - Keep the master agent focused on coordination, review, and final decisions.
 - Keep `memory.json` and `skills/` as durable context, not repeated chat history.
+- Use `web_search` for internet lookups. It defaults to DuckDuckGo and should be used for recent upstream context, docs, and external references.
 - Do not revert unrelated user changes.
 - Preserve kernel backport constraints: minimal patching, semantic conflict resolution, targeted validation.
 

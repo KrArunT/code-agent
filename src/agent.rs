@@ -579,6 +579,10 @@ impl Agent {
                 }
                 Ok(false)
             }
+            "/search" => {
+                ui::render_markdown(&self.handle_search_command(arg).await?);
+                Ok(false)
+            }
             "/help" => {
                 println!("{}", ui::help_text());
                 Ok(false)
@@ -804,6 +808,13 @@ impl Agent {
                 }
                 Ok(false)
             }
+            "/search" => {
+                transcript.push(TranscriptItem::new(
+                    "system",
+                    self.handle_search_command(arg).await?,
+                ));
+                Ok(false)
+            }
             "/provider" => {
                 transcript.push(TranscriptItem::new(
                     "system",
@@ -1003,6 +1014,15 @@ impl Agent {
                 Ok(None)
             }
         }
+    }
+
+    async fn handle_search_command(&mut self, arg: &str) -> Result<String> {
+        if arg.trim().is_empty() {
+            ui::error("usage: /search <query>");
+            return Ok("usage: /search <query>".to_string());
+        }
+
+        self.tools.web_search(arg, 5).await
     }
 
     async fn handle_config_command(&mut self, arg: &str) -> Result<String> {
@@ -2994,7 +3014,7 @@ fn tui_heading(line: &str) -> Option<(usize, &str)> {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /interrupt\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nCtrl-C interrupts the active model stream and saves the session."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /search <query>\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /interrupt\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nCtrl-C interrupts the active model stream and saves the session."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
@@ -3007,6 +3027,7 @@ fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
         vec![
             "/help commands".to_string(),
             "/models local models".to_string(),
+            "/search web search".to_string(),
             "/permissions safety".to_string(),
             "/terminal real shell".to_string(),
             "/exit quit".to_string(),
@@ -3312,6 +3333,7 @@ Backporting workflow:
 - For conflicts, explain which side was kept, what was adapted, and why.
 - For missing prerequisite functionality, either backport the minimal dependency or adapt to the target API; state the tradeoff.
 - For kernel code, avoid broad refactors unless they are required for correctness.
+- Use the built-in `web_search` tool for internet lookups. It defaults to DuckDuckGo and should be used when you need recent upstream context, documentation, or external references.
 - After edits, run focused checks when possible, such as compile checks, relevant selftests, scripts/checkpatch.pl for patch hygiene, or grep-based validation.
 - When the task is done, return a fenced JSON control block with `{"state":"final","summary":"..."}` instead of continuing to call tools.
 - When the task cannot proceed, return `{"state":"blocked","reason":"..."}`.
@@ -3341,6 +3363,7 @@ Available tools:
 - read_file: {"tool":"read_file","path":"relative/path"}
 - write_file: {"tool":"write_file","path":"relative/path","content":"full file content"}
 - run_shell: {"tool":"run_shell","command":"cargo test"}
+- web_search: {"tool":"web_search","query":"linux kernel backporting", "max_results": 5}
 - spawn_worker: {"tool":"spawn_worker","name":"optional label","task":"isolated task text"}
 - list_workers: {"tool":"list_workers"}
 - read_worker: {"tool":"read_worker","id":"worker-id"}
