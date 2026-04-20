@@ -205,7 +205,7 @@ impl Config {
     }
 
     pub fn config_file_exists(&self) -> bool {
-        self.config_file.exists() || self.legacy_config_file().exists()
+        self.config_source_path().is_some()
     }
 
     pub fn config_file_modified_time(&self) -> Result<Option<SystemTime>> {
@@ -221,15 +221,8 @@ impl Config {
     }
 
     pub fn load_config_file(&self) -> Result<Option<ConfigFile>> {
-        let path = if self.config_file.exists() {
-            self.config_file.clone()
-        } else {
-            let legacy = self.legacy_config_file();
-            if legacy.exists() {
-                legacy
-            } else {
-                return Ok(None);
-            }
+        let Some(path) = self.config_source_path() else {
+            return Ok(None);
         };
         let path_display = path.display().to_string();
         let text = fs::read_to_string(&path)
@@ -483,16 +476,31 @@ impl Config {
     }
 
     fn config_source_path(&self) -> Option<PathBuf> {
-        if self.config_file.exists() {
+        if self.config_file.exists() && !self.is_control_dir_path(&self.config_file) {
             Some(self.config_file.clone())
         } else {
             let legacy = self.legacy_config_file();
-            if legacy.exists() {
+            if legacy.exists() && !self.is_control_dir_path(&legacy) {
                 Some(legacy)
             } else {
-                None
+                let workspace_default = self.workspace.join("autofix_config.json");
+                if workspace_default.exists() && !self.is_control_dir_path(&workspace_default) {
+                    Some(workspace_default)
+                } else {
+                    let workspace_legacy = self.workspace.join("config.json");
+                    if workspace_legacy.exists() && !self.is_control_dir_path(&workspace_legacy) {
+                        Some(workspace_legacy)
+                    } else {
+                        None
+                    }
+                }
             }
         }
+    }
+
+    fn is_control_dir_path(&self, path: &PathBuf) -> bool {
+        path.ancestors()
+            .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some(".autofix"))
     }
 
     async fn finish_resolve(mut self) -> Result<Self> {
@@ -688,5 +696,42 @@ mod tests {
         let config = Config::parse_from(["autofix", "--unlimited-tool-rounds"]);
         assert!(config.unlimited_tool_rounds());
         assert_eq!(config.effective_max_tool_rounds(), None);
+    }
+
+    #[test]
+    fn config_source_path_avoids_control_directory_sources() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "autofix-config-source-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let workspace = dir.join("workspace");
+        let control = workspace.join(".autofix");
+        fs::create_dir_all(&control).expect("failed to create control dir");
+        let control_config = control.join("autofix_config.json");
+        let workspace_config = workspace.join("autofix_config.json");
+        fs::write(&control_config, "{\"autonomous\":false}")
+            .expect("failed to write control config");
+        fs::write(&workspace_config, "{\"autonomous\":true}")
+            .expect("failed to write workspace config");
+
+        let config = Config::parse_from([
+            "autofix",
+            "--workspace",
+            workspace.to_str().expect("workspace path not utf-8"),
+            "--config-file",
+            control_config.to_str().expect("control path not utf-8"),
+        ]);
+        let config = tokio::runtime::Runtime::new()
+            .expect("failed to create runtime")
+            .block_on(config.resolve())
+            .expect("resolve failed");
+
+        assert_eq!(config.autonomous, true);
+        assert_eq!(config.config_file, control_config);
     }
 }
