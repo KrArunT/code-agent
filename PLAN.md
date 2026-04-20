@@ -6,6 +6,7 @@
 - The master agent can spawn workers, list them, and inspect their records without sharing workspace state.
 - Tool execution now batches multiple fenced JSON tool blocks from one assistant message before the next model turn.
 - The UI now shows live progress messages for thinking, tool execution, and worker startup/completion.
+- The agent can now end a turn explicitly with `final`, `blocked`, or `needs_worker` control directives instead of relying only on the round cap.
 - The agent keeps its session plan in this file and rewrites it as the session changes.
 
 ## Files Changed
@@ -30,5 +31,6 @@
 
 - Use `/agents spawn <name> | <task>` for side tasks that should live in a separate worktree.
 - Encourage the model to batch related reads and edits into one assistant turn instead of burning tool rounds one call at a time.
+- Encourage the model to use control directives when the remaining work is only a summary, a blocker, or a worker handoff.
 - Keep `PLAN.md` updated after each meaningful state change.
 - Run focused validation before reporting a backport or code change complete.

@@ -1617,7 +1617,15 @@ impl Agent {
 
     async fn respond(&mut self) -> Result<()> {
         let total_rounds = self.config.effective_max_tool_rounds();
+        let mut warned_near_limit = false;
         for round in 0..=total_rounds {
+            if !warned_near_limit && round >= total_rounds.saturating_sub(1) {
+                self.messages.push(Message {
+                    role: Role::System,
+                    content: "You are close to the tool budget limit. Prefer one of these outcomes now: return a final answer, return a fenced JSON control block with state final|blocked|needs_worker, or delegate remaining work to a worker. Do not keep making exploratory tool calls unless they are essential.".to_string(),
+                });
+                warned_near_limit = true;
+            }
             self.set_progress(format!(
                 "round {}/{}: thinking",
                 round + 1,
@@ -1667,6 +1675,40 @@ impl Agent {
                 role: Role::Assistant,
                 content: answer.clone(),
             });
+
+            if let Some(directive) = extract_control_directive(&answer)? {
+                match directive {
+                    AgentDirective::Final { summary } => {
+                        if !summary.trim().is_empty() {
+                            self.messages.push(Message {
+                                role: Role::User,
+                                content: format!("Final summary:\n{summary}"),
+                            });
+                        }
+                        self.set_progress("complete");
+                        return Ok(());
+                    }
+                    AgentDirective::Blocked { reason } => {
+                        if !reason.trim().is_empty() {
+                            self.messages.push(Message {
+                                role: Role::User,
+                                content: format!("Blocked:\n{reason}"),
+                            });
+                        }
+                        self.set_progress("blocked");
+                        return Ok(());
+                    }
+                    AgentDirective::NeedsWorker { task } => {
+                        let result = self.spawn_worker(None, task).await?;
+                        ui::info(&result);
+                        self.messages.push(Message {
+                            role: Role::User,
+                            content: format!("Worker spawned:\n{result}"),
+                        });
+                        continue;
+                    }
+                }
+            }
 
             let tool_calls = match extract_tool_calls(&answer) {
                 Ok(tool_calls) if tool_calls.is_empty() => {
@@ -2846,6 +2888,33 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AgentDirective {
+    Final { summary: String },
+    Blocked { reason: String },
+    NeedsWorker { task: String },
+}
+
+fn extract_control_directive(text: &str) -> Result<Option<AgentDirective>> {
+    let Some(start) = text.find("```json") else {
+        return Ok(None);
+    };
+    let json_start = start + "```json".len();
+    let Some(end) = text[json_start..].find("```") else {
+        return Ok(None);
+    };
+    let json_text = &text[json_start..json_start + end];
+    let value: serde_json::Value = serde_json::from_str(json_text.trim())
+        .with_context(|| format!("failed to parse control JSON: {json_text}"))?;
+    if value.get("tool").is_some() {
+        return Ok(None);
+    }
+    let directive = serde_json::from_value::<AgentDirective>(value)
+        .with_context(|| format!("failed to parse control directive: {json_text}"))?;
+    Ok(Some(directive))
+}
+
 fn default_system_prompt() -> String {
     r#"You are an autonomous Linux kernel backporting agent running inside a local workspace.
 
@@ -2864,6 +2933,10 @@ Backporting workflow:
 - For missing prerequisite functionality, either backport the minimal dependency or adapt to the target API; state the tradeoff.
 - For kernel code, avoid broad refactors unless they are required for correctness.
 - After edits, run focused checks when possible, such as compile checks, relevant selftests, scripts/checkpatch.pl for patch hygiene, or grep-based validation.
+- When the task is done, return a fenced JSON control block with `{"state":"final","summary":"..."}` instead of continuing to call tools.
+- When the task cannot proceed, return `{"state":"blocked","reason":"..."}`.
+- When remaining work should move to a separate worktree, return `{"state":"needs_worker","task":"..."}`.
+- Near the tool budget limit, stop exploring and choose final, blocked, or needs_worker.
 
 Safety rules:
 - Treat shell commands and writes as potentially risky and use the available tool workflow.

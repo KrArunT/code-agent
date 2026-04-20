@@ -387,6 +387,18 @@ Supported tools:
 Tool paths are workspace-relative. Absolute paths and parent-directory escapes are rejected.
 Multiple fenced tool blocks in one assistant message are executed in order before the next model turn. That reduces unnecessary loop turns and makes the agent behave more like a Codex-style controller.
 
+The model can also end a turn explicitly with a control directive instead of a tool call:
+
+```json
+{"state":"final","summary":"Done. The patch compiles and the remaining work is documented in PLAN.md."}
+```
+
+Supported control states:
+
+- `final`: finish the task and return the summary to the user.
+- `blocked`: stop and report a blocker.
+- `needs_worker`: spawn an isolated worker for the remaining subtask.
+
 ## Notes
 
 - `/shell` captures command output and feeds it through the TUI renderer.
