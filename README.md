@@ -417,7 +417,7 @@ TUI navigation:
 | Workspace | `/attach image <path>` | Queue an image reference and metadata to prepend to the next prompt. |
 | Workspace | `/attach show` | Show queued prompt attachments. |
 | Workspace | `/attach clear` | Clear queued prompt attachments. |
-| Workspace | `/search <query>` | Search the web with DuckDuckGo and render compact results. |
+| Workspace | `/search <query>` | Search the web with DuckDuckGo and open a picker in TUI. |
 | Session | `/session` | Show the active session state. |
 | Session | `/session list` | List saved sessions. |
 | Session | `/session history` | Show the active command history. |
@@ -476,17 +476,17 @@ Mode behavior:
 
 ## Agent Tool Calls
 
-The model can request one or more tool calls by returning fenced JSON blocks:
+The model uses a Codex-style JSON turn protocol:
 
 ```json
-{"tool":"read_file","path":"src/main.rs"}
+{"type":"tool_calls","calls":[{"tool":"read_file","path":"src/main.rs"},{"tool":"list_files","path":"src"}]}
 ```
 
 ```json
-{"tool":"list_files","path":"src"}
+{"type":"final","summary":"Done. The patch compiles and the remaining work is documented in PLAN.md."}
 ```
 
-Supported tools:
+Supported tools inside `calls`:
 
 - `list_files`: `{ "tool": "list_files", "path": "." }`
 - `read_file`: `{ "tool": "read_file", "path": "src/main.rs" }`
@@ -498,19 +498,9 @@ Supported tools:
 - `read_worker`: `{ "tool": "read_worker", "id": "worker-id" }`
 
 Tool paths are workspace-relative. Absolute paths and parent-directory escapes are rejected.
-Multiple fenced tool blocks in one assistant message are executed in order before the next model turn. That reduces unnecessary loop turns and makes the agent behave more like a Codex-style controller.
+The agent executes every tool in the `calls` array in order, then sends the results back as one tool-result turn. That keeps the loop closer to Codex-style function calling and reduces round churn.
 
-The model can also end a turn explicitly with a control directive instead of a tool call:
-
-```json
-{"state":"final","summary":"Done. The patch compiles and the remaining work is documented in PLAN.md."}
-```
-
-Supported control states:
-
-- `final`: finish the task and return the summary to the user.
-- `blocked`: stop and report a blocker.
-- `needs_worker`: spawn an isolated worker for the remaining subtask.
+The model can also use `{"type":"final","summary":"..."}`, `{"type":"blocked","reason":"..."}`, or `{"type":"needs_worker","task":"..."}` as explicit completion states.
 
 ## Notes
 

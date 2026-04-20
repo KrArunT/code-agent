@@ -359,7 +359,7 @@ pub fn help_text() -> &'static str {
   /attach image <path> append an image reference to the next prompt
   /attach show       show queued prompt attachments
   /attach clear      clear queued prompt attachments
-  /search <query>    search the web with DuckDuckGo
+  /search <query>    search the web with DuckDuckGo; TUI shows a picker
   /shell             enter shell mode
   /shell <command>   run one shell command with confirmation
   !<command>         run one shell command from chat mode

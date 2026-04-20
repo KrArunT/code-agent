@@ -7,7 +7,7 @@ use crate::{
         session_history_summary, session_tail_summary, session_title_from_input, summarize_session,
         SessionRecord,
     },
-    tools::{ToolCall, ToolRuntime},
+    tools::{SearchResult, ToolCall, ToolRuntime},
     ui,
     workers::{
         list_worker_records, load_worker_record, make_worker_id, now_epoch,
@@ -30,7 +30,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
     },
     Terminal,
 };
@@ -60,6 +61,7 @@ pub struct Agent {
     session: SessionRecord,
     shell_mode: bool,
     prompt_attachments: Vec<PromptAttachment>,
+    search_picker: Option<SearchPicker>,
     memory_store: MemoryStore,
     skills: Vec<LoadedSkill>,
     completion_workspace: Arc<Mutex<PathBuf>>,
@@ -99,6 +101,7 @@ impl Agent {
             session,
             shell_mode: false,
             prompt_attachments: Vec::new(),
+            search_picker: None,
             memory_store,
             skills,
             completion_workspace: Arc::new(Mutex::new(completion_workspace)),
@@ -302,6 +305,7 @@ impl Agent {
                     &status,
                     show_help,
                     scroll_offset,
+                    self.search_picker.as_ref(),
                 )?;
                 needs_draw = false;
             }
@@ -312,12 +316,75 @@ impl Agent {
 
             match event::read()? {
                 Event::Mouse(mouse) => {
-                    if handle_mouse_event(mouse, size, &transcript, &mut scroll_offset)? {
-                        needs_draw = true;
+                    if self.search_picker.is_none() {
+                        if handle_mouse_event(mouse, size, &transcript, &mut scroll_offset)? {
+                            needs_draw = true;
+                        }
                     }
                 }
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    if self.search_picker.is_some() {
+                        let mut close_picker = false;
+                        match key.code {
+                            KeyCode::Esc => {
+                                close_picker = true;
+                                status = "ready".to_string();
+                            }
+                            KeyCode::Enter => {
+                                if let Some(picker) = self.search_picker.as_ref() {
+                                    if let Some(result) = picker.selected_result() {
+                                        input = result.url.clone();
+                                        transcript.push(TranscriptItem::new(
+                                            "system",
+                                            format!(
+                                                "selected search result:\n{}\n{}\n{}",
+                                                result.title, result.url, result.snippet
+                                            ),
+                                        ));
+                                        status = "search selected".to_string();
+                                        needs_draw = true;
+                                    }
+                                }
+                                close_picker = true;
+                            }
+                            KeyCode::Up => {
+                                if let Some(picker) = self.search_picker.as_mut() {
+                                    picker.selected = picker.selected.saturating_sub(1);
+                                }
+                                needs_draw = true;
+                            }
+                            KeyCode::Down => {
+                                if let Some(picker) = self.search_picker.as_mut() {
+                                    if picker.selected + 1 < picker.results.len() {
+                                        picker.selected += 1;
+                                    }
+                                }
+                                needs_draw = true;
+                            }
+                            KeyCode::Home => {
+                                if let Some(picker) = self.search_picker.as_mut() {
+                                    picker.selected = 0;
+                                }
+                                needs_draw = true;
+                            }
+                            KeyCode::End => {
+                                if let Some(picker) = self.search_picker.as_mut() {
+                                    if let Some(last) = picker.results.len().checked_sub(1) {
+                                        picker.selected = last;
+                                    }
+                                }
+                                needs_draw = true;
+                            }
+                            _ => {}
+                        }
+                        if close_picker {
+                            self.search_picker = None;
+                            needs_draw = true;
+                        }
                         continue;
                     }
 
@@ -445,6 +512,7 @@ impl Agent {
                                 &status,
                                 show_help,
                                 scroll_offset,
+                                self.search_picker.as_ref(),
                             )?;
 
                             self.reset_interrupt_flag();
@@ -483,6 +551,7 @@ impl Agent {
                                             &status,
                                             show_help,
                                             scroll_offset,
+                                            self.search_picker.as_ref(),
                                         )?;
                                         Ok(())
                                     },
@@ -809,10 +878,17 @@ impl Agent {
                 Ok(false)
             }
             "/search" => {
-                transcript.push(TranscriptItem::new(
-                    "system",
-                    self.handle_search_command(arg).await?,
-                ));
+                if let Some(summary) = self.handle_search_picker_command(arg).await? {
+                    transcript.push(TranscriptItem::new("system", summary));
+                } else if let Some(picker) = &self.search_picker {
+                    transcript.push(TranscriptItem::new(
+                        "system",
+                        format!(
+                            "search results for `{}` loaded: use ↑/↓ and Enter to pick",
+                            picker.query
+                        ),
+                    ));
+                }
                 Ok(false)
             }
             "/provider" => {
@@ -1014,6 +1090,21 @@ impl Agent {
                 Ok(None)
             }
         }
+    }
+
+    async fn handle_search_picker_command(&mut self, arg: &str) -> Result<Option<String>> {
+        if arg.trim().is_empty() {
+            ui::error("usage: /search <query>");
+            return Ok(Some("usage: /search <query>".to_string()));
+        }
+
+        let results = self.tools.web_search_results(arg, 5).await?;
+        if results.is_empty() {
+            return Ok(Some(format!("no DuckDuckGo results found for `{arg}`")));
+        }
+
+        self.search_picker = Some(SearchPicker::new(arg.to_string(), results));
+        Ok(None)
     }
 
     async fn handle_search_command(&mut self, arg: &str) -> Result<String> {
@@ -1900,7 +1991,7 @@ impl Agent {
             if !warned_near_limit && round >= total_rounds.saturating_sub(1) {
                 self.messages.push(Message {
                     role: Role::System,
-                    content: "You are close to the tool budget limit. Prefer one of these outcomes now: return a final answer, return a fenced JSON control block with state final|blocked|needs_worker, or delegate remaining work to a worker. Do not keep making exploratory tool calls unless they are essential.".to_string(),
+                    content: "You are close to the tool budget limit. Prefer one of these outcomes now: return a final JSON turn, return a blocked JSON turn, or delegate remaining work to a worker. Use the Codex-style turn protocol and do not keep making exploratory tool calls unless they are essential.".to_string(),
                 });
                 warned_near_limit = true;
             }
@@ -1974,88 +2065,119 @@ impl Agent {
                 content: answer.clone(),
             });
 
-            if let Some(directive) = extract_control_directive(&answer)? {
-                match directive {
-                    AgentDirective::Final { summary } => {
-                        if !summary.trim().is_empty() {
-                            self.messages.push(Message {
-                                role: Role::User,
-                                content: format!("Final summary:\n{summary}"),
-                            });
-                        }
-                        self.set_progress("complete");
-                        return Ok(());
-                    }
-                    AgentDirective::Blocked { reason } => {
-                        if !reason.trim().is_empty() {
-                            self.messages.push(Message {
-                                role: Role::User,
-                                content: format!("Blocked:\n{reason}"),
-                            });
-                        }
-                        self.set_progress("blocked");
-                        return Ok(());
-                    }
-                    AgentDirective::NeedsWorker { task } => {
-                        let result = self.spawn_worker(None, task).await?;
-                        ui::info(&result);
+            match parse_agent_turn(&answer)? {
+                Some(AgentTurn::Final { summary }) => {
+                    if !summary.trim().is_empty() {
                         self.messages.push(Message {
                             role: Role::User,
-                            content: format!("Worker spawned:\n{result}"),
+                            content: format!("Final summary:\n{summary}"),
                         });
-                        continue;
                     }
-                }
-            }
-
-            let tool_calls = match extract_tool_calls(&answer) {
-                Ok(tool_calls) if tool_calls.is_empty() => {
                     self.set_progress("complete");
                     return Ok(());
                 }
-                Ok(tool_calls) => tool_calls,
-                Err(err) => {
-                    let message = format!(
-                        "tool call parse error: {err}\nReturn either a final answer or one or more valid ```json tool blocks."
-                    );
-                    ui::error(&message);
+                Some(AgentTurn::Blocked { reason }) => {
+                    if !reason.trim().is_empty() {
+                        self.messages.push(Message {
+                            role: Role::User,
+                            content: format!("Blocked:\n{reason}"),
+                        });
+                    }
+                    self.set_progress("blocked");
+                    return Ok(());
+                }
+                Some(AgentTurn::NeedsWorker { task }) => {
+                    let result = self.spawn_worker(None, task).await?;
+                    ui::info(&result);
                     self.messages.push(Message {
                         role: Role::User,
-                        content: message,
+                        content: format!("Worker spawned:\n{result}"),
                     });
                     continue;
                 }
-            };
+                Some(AgentTurn::ToolCalls { calls: tool_calls }) => {
+                    let tool_total = tool_calls.len();
+                    let mut result_lines = Vec::new();
+                    for (index, tool_call) in tool_calls.into_iter().enumerate() {
+                        let tool_label = tool_call.summary();
+                        self.set_progress(format!(
+                            "round {}/{}: executing {} ({}/{})",
+                            round + 1,
+                            total_rounds + 1,
+                            tool_label,
+                            index + 1,
+                            tool_total
+                        ));
+                        ui::tool_start(&tool_label);
+                        let result = match self.execute_tool_call(tool_call).await {
+                            Ok(result) => result,
+                            Err(err) => format!("tool execution error: {err}"),
+                        };
+                        ui::tool_result(&tool_label, &result);
+                        result_lines.push(format!("{}: {result}", index + 1));
+                    }
+                    let result = if result_lines.len() == 1 {
+                        result_lines.remove(0)
+                    } else {
+                        format!("Tool results:\n{}", result_lines.join("\n"))
+                    };
+                    self.messages.push(Message {
+                        role: Role::User,
+                        content: format!("Tool result:\n{result}"),
+                    });
+                    continue;
+                }
+                None => {
+                    let tool_calls = match extract_tool_calls(&answer) {
+                        Ok(tool_calls) if tool_calls.is_empty() => {
+                            self.set_progress("complete");
+                            return Ok(());
+                        }
+                        Ok(tool_calls) => tool_calls,
+                        Err(err) => {
+                            let message = format!(
+                                "tool call parse error: {err}\nReturn a single JSON turn object like {{\"type\":\"tool_calls\",\"calls\":[...]}} or {{\"type\":\"final\",\"summary\":\"...\"}}."
+                            );
+                            ui::error(&message);
+                            self.messages.push(Message {
+                                role: Role::User,
+                                content: message,
+                            });
+                            continue;
+                        }
+                    };
 
-            let tool_total = tool_calls.len();
-            let mut result_lines = Vec::new();
-            for (index, tool_call) in tool_calls.into_iter().enumerate() {
-                let tool_label = tool_call.summary();
-                self.set_progress(format!(
-                    "round {}/{}: executing {} ({}/{})",
-                    round + 1,
-                    total_rounds + 1,
-                    tool_label,
-                    index + 1,
-                    tool_total
-                ));
-                ui::tool_start(&tool_label);
-                let result = match self.execute_tool_call(tool_call).await {
-                    Ok(result) => result,
-                    Err(err) => format!("tool execution error: {err}"),
-                };
-                ui::tool_result(&tool_label, &result);
-                result_lines.push(format!("{}: {result}", index + 1));
+                    let tool_total = tool_calls.len();
+                    let mut result_lines = Vec::new();
+                    for (index, tool_call) in tool_calls.into_iter().enumerate() {
+                        let tool_label = tool_call.summary();
+                        self.set_progress(format!(
+                            "round {}/{}: executing {} ({}/{})",
+                            round + 1,
+                            total_rounds + 1,
+                            tool_label,
+                            index + 1,
+                            tool_total
+                        ));
+                        ui::tool_start(&tool_label);
+                        let result = match self.execute_tool_call(tool_call).await {
+                            Ok(result) => result,
+                            Err(err) => format!("tool execution error: {err}"),
+                        };
+                        ui::tool_result(&tool_label, &result);
+                        result_lines.push(format!("{}: {result}", index + 1));
+                    }
+                    let result = if result_lines.len() == 1 {
+                        result_lines.remove(0)
+                    } else {
+                        format!("Tool results:\n{}", result_lines.join("\n"))
+                    };
+                    self.messages.push(Message {
+                        role: Role::User,
+                        content: format!("Tool result:\n{result}"),
+                    });
+                }
             }
-            let result = if result_lines.len() == 1 {
-                result_lines.remove(0)
-            } else {
-                format!("Tool results:\n{}", result_lines.join("\n"))
-            };
-            self.messages.push(Message {
-                role: Role::User,
-                content: format!("Tool result:\n{result}"),
-            });
         }
 
         self.set_progress("stopped after max tool rounds");
@@ -2299,6 +2421,27 @@ impl PromptAttachment {
             Self::File { path, .. } => format!("file:{path}"),
             Self::Image { path, .. } => format!("image:{path}"),
         }
+    }
+}
+
+#[derive(Clone)]
+struct SearchPicker {
+    query: String,
+    results: Vec<SearchResult>,
+    selected: usize,
+}
+
+impl SearchPicker {
+    fn new(query: String, results: Vec<SearchResult>) -> Self {
+        Self {
+            query,
+            results,
+            selected: 0,
+        }
+    }
+
+    fn selected_result(&self) -> Option<&SearchResult> {
+        self.results.get(self.selected)
     }
 }
 
@@ -2617,6 +2760,7 @@ fn draw_tui(
     status: &str,
     show_help: bool,
     scroll_offset: usize,
+    search_picker: Option<&SearchPicker>,
 ) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.size();
@@ -2764,6 +2908,58 @@ fn draw_tui(
                 .block(Block::default().borders(Borders::ALL).title("help"))
                 .wrap(Wrap { trim: false });
             frame.render_widget(help, overlay_area);
+        }
+
+        if let Some(picker) = search_picker {
+            let overlay_area = centered_rect(84, 70, area);
+            frame.render_widget(Clear, overlay_area);
+
+            let items = picker
+                .results
+                .iter()
+                .map(|result| {
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled("• ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            result.title.clone(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ])];
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(result.url.clone(), Style::default().fg(Color::Blue)),
+                    ]));
+                    if !result.snippet.trim().is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(result.snippet.clone(), Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                    ListItem::new(lines)
+                })
+                .collect::<Vec<_>>();
+
+            let mut list_state = ListState::default();
+            list_state.select(Some(picker.selected));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("search: {}", picker.query))
+                        .title_bottom(Line::from(vec![Span::styled(
+                            "↑/↓ move  Enter insert URL  Esc close",
+                            Style::default().fg(Color::DarkGray),
+                        )])),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                );
+            frame.render_stateful_widget(list, overlay_area, &mut list_state);
         }
     })?;
     Ok(())
@@ -3078,7 +3274,7 @@ fn status_color(status: &str) -> Color {
 }
 
 fn tui_help_text() -> &'static str {
-    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /search <query>\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /interrupt\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nCtrl-C interrupts the active model stream and saves the session."
+    "Ratatui mode commands:\n- /help\n- /config\n- /config reload\n- /provider\n- /models\n- /use-model <name>\n- /thinking [auto|on|off|low|medium|high|show|hide]\n- /attach [show|clear|file <path>|image <path>]\n- /search <query> (opens a result picker)\n- /worktree [status|list|auto|add <path> [branch]|switch <path>|remove <path>|prune]\n- /agents [list|spawn <name> | <task>|read <id>]\n- /session [show|list|history|save|new|resume <id>]\n- /history\n- /interrupt\n- /clear\n- /exit\n\nMouse and keyboard navigation:\n- Mouse wheel scrolls the transcript\n- Drag or click the scrollbar to reposition\n- Up/Down browse history when the input is empty\n- PgUp/PgDn scroll the transcript\n- ? toggles this help overlay\n\nCtrl-C interrupts the active model stream and saves the session."
 }
 
 fn onboarding_text(full_system_access: bool, onboarding: &[String]) -> String {
@@ -3275,37 +3471,130 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "state", rename_all = "lowercase")]
-enum AgentDirective {
-    Final {
-        summary: String,
-    },
-    Blocked {
-        reason: String,
-    },
-    #[serde(rename = "needs_worker")]
-    NeedsWorker {
-        task: String,
-    },
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AgentTurn {
+    ToolCalls { calls: Vec<ToolCall> },
+    Final { summary: String },
+    Blocked { reason: String },
+    NeedsWorker { task: String },
 }
 
-fn extract_control_directive(text: &str) -> Result<Option<AgentDirective>> {
-    let Some(start) = text.find("```json") else {
+fn parse_agent_turn(text: &str) -> Result<Option<AgentTurn>> {
+    let Some(json_text) = extract_json_candidate(text) else {
         return Ok(None);
     };
-    let json_start = start + "```json".len();
-    let Some(end) = text[json_start..].find("```") else {
-        return Ok(None);
-    };
-    let json_text = &text[json_start..json_start + end];
     let value: serde_json::Value = serde_json::from_str(json_text.trim())
-        .with_context(|| format!("failed to parse control JSON: {json_text}"))?;
-    if value.get("tool").is_some() {
-        return Ok(None);
+        .with_context(|| format!("failed to parse turn JSON: {json_text}"))?;
+    if let Some(turn) = parse_agent_turn_value(&value, json_text)? {
+        return Ok(Some(turn));
     }
-    let directive = serde_json::from_value::<AgentDirective>(value)
-        .with_context(|| format!("failed to parse control directive: {json_text}"))?;
-    Ok(Some(directive))
+    Ok(None)
+}
+
+fn extract_json_candidate(text: &str) -> Option<&str> {
+    if let Some(start) = text.find("```json") {
+        let json_start = start + "```json".len();
+        let end = text[json_start..].find("```")?;
+        return Some(&text[json_start..json_start + end]);
+    }
+
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+fn parse_agent_turn_value(value: &serde_json::Value, raw: &str) -> Result<Option<AgentTurn>> {
+    if let Ok(turn) = serde_json::from_value::<AgentTurn>(value.clone()) {
+        return Ok(Some(turn));
+    }
+
+    if let Some(state) = value.get("state").and_then(|state| state.as_str()) {
+        match state {
+            "final" => {
+                if let Some(summary) = value.get("summary").and_then(|summary| summary.as_str()) {
+                    return Ok(Some(AgentTurn::Final {
+                        summary: summary.to_string(),
+                    }));
+                }
+            }
+            "blocked" => {
+                if let Some(reason) = value.get("reason").and_then(|reason| reason.as_str()) {
+                    return Ok(Some(AgentTurn::Blocked {
+                        reason: reason.to_string(),
+                    }));
+                }
+            }
+            "needs_worker" => {
+                if let Some(task) = value.get("task").and_then(|task| task.as_str()) {
+                    return Ok(Some(AgentTurn::NeedsWorker {
+                        task: task.to_string(),
+                    }));
+                }
+            }
+            "tool_calls" => {
+                if let Some(calls) = value.get("calls").or_else(|| value.get("tool_calls")) {
+                    let calls = parse_tool_calls_value(calls, raw)?;
+                    return Ok(Some(AgentTurn::ToolCalls { calls }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(kind) = value.get("kind").and_then(|kind| kind.as_str()) {
+        if kind == "tool_calls" {
+            if let Some(calls) = value.get("calls").or_else(|| value.get("tool_calls")) {
+                let calls = parse_tool_calls_value(calls, raw)?;
+                return Ok(Some(AgentTurn::ToolCalls { calls }));
+            }
+        }
+    }
+
+    if value.get("tool").is_some() {
+        let call = serde_json::from_value::<ToolCall>(value.clone())
+            .with_context(|| format!("failed to parse tool call JSON: {raw}"))?;
+        return Ok(Some(AgentTurn::ToolCalls { calls: vec![call] }));
+    }
+
+    if let Some(calls) = value.get("calls").or_else(|| value.get("tool_calls")) {
+        let calls = parse_tool_calls_value(calls, raw)?;
+        return Ok(Some(AgentTurn::ToolCalls { calls }));
+    }
+
+    if value.is_array() {
+        let calls = serde_json::from_value::<Vec<ToolCall>>(value.clone())
+            .with_context(|| format!("failed to parse tool call array: {raw}"))?;
+        return Ok(Some(AgentTurn::ToolCalls { calls }));
+    }
+
+    if value
+        .get("summary")
+        .and_then(|summary| summary.as_str())
+        .is_some()
+        && value.get("final").is_some()
+    {
+        if let Some(summary) = value.get("summary").and_then(|summary| summary.as_str()) {
+            return Ok(Some(AgentTurn::Final {
+                summary: summary.to_string(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_tool_calls_value(value: &serde_json::Value, raw: &str) -> Result<Vec<ToolCall>> {
+    if value.is_array() {
+        serde_json::from_value::<Vec<ToolCall>>(value.clone())
+            .with_context(|| format!("failed to parse tool call array: {raw}"))
+    } else {
+        let call = serde_json::from_value::<ToolCall>(value.clone())
+            .with_context(|| format!("failed to parse tool call JSON: {raw}"))?;
+        Ok(vec![call])
+    }
 }
 
 #[cfg(test)]
@@ -3337,44 +3626,71 @@ Here is the work.
     }
 
     #[test]
-    fn parses_control_directives() {
+    fn parses_codex_turn_object() {
+        let turn = r#"
+```json
+{"type":"tool_calls","calls":[{"tool":"read_file","path":"src/main.rs"},{"tool":"list_files","path":"src"}]}
+```
+"#;
+
+        match parse_agent_turn(turn)
+            .expect("turn should parse")
+            .expect("turn should exist")
+        {
+            AgentTurn::ToolCalls { calls } => {
+                assert_eq!(calls.len(), 2);
+                match &calls[0] {
+                    ToolCall::ReadFile { path } => assert_eq!(path, "src/main.rs"),
+                    other => panic!("unexpected first call: {other:?}"),
+                }
+                match &calls[1] {
+                    ToolCall::ListFiles { path } => assert_eq!(path.as_deref(), Some("src")),
+                    other => panic!("unexpected second call: {other:?}"),
+                }
+            }
+            other => panic!("unexpected turn: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_final_directive() {
         let final_block = r#"
 ```json
-{"state":"final","summary":"done"}
+{"type":"final","summary":"done"}
 ```
 "#;
         let blocked_block = r#"
 ```json
-{"state":"blocked","reason":"missing context"}
+{"type":"blocked","reason":"missing context"}
 ```
 "#;
         let worker_block = r#"
 ```json
-{"state":"needs_worker","task":"isolate parser work"}
+{"type":"needs_worker","task":"isolate parser work"}
 ```
 "#;
 
-        match extract_control_directive(final_block)
+        match parse_agent_turn(final_block)
             .expect("final directive should parse")
             .expect("directive should exist")
         {
-            AgentDirective::Final { summary } => assert_eq!(summary, "done"),
+            AgentTurn::Final { summary } => assert_eq!(summary, "done"),
             other => panic!("unexpected directive: {other:?}"),
         }
 
-        match extract_control_directive(blocked_block)
+        match parse_agent_turn(blocked_block)
             .expect("blocked directive should parse")
             .expect("directive should exist")
         {
-            AgentDirective::Blocked { reason } => assert_eq!(reason, "missing context"),
+            AgentTurn::Blocked { reason } => assert_eq!(reason, "missing context"),
             other => panic!("unexpected directive: {other:?}"),
         }
 
-        match extract_control_directive(worker_block)
+        match parse_agent_turn(worker_block)
             .expect("worker directive should parse")
             .expect("directive should exist")
         {
-            AgentDirective::NeedsWorker { task } => assert_eq!(task, "isolate parser work"),
+            AgentTurn::NeedsWorker { task } => assert_eq!(task, "isolate parser work"),
             other => panic!("unexpected directive: {other:?}"),
         }
     }
@@ -3399,9 +3715,13 @@ Backporting workflow:
 - For kernel code, avoid broad refactors unless they are required for correctness.
 - Use the built-in `web_search` tool for internet lookups. It defaults to DuckDuckGo and should be used when you need recent upstream context, documentation, or external references.
 - After edits, run focused checks when possible, such as compile checks, relevant selftests, scripts/checkpatch.pl for patch hygiene, or grep-based validation.
-- When the task is done, return a fenced JSON control block with `{"state":"final","summary":"..."}` instead of continuing to call tools.
-- When the task cannot proceed, return `{"state":"blocked","reason":"..."}`.
-- When remaining work should move to a separate worktree, return `{"state":"needs_worker","task":"..."}`.
+- Use the Codex-style turn protocol:
+  - When tools are needed, return a single JSON object with `{"type":"tool_calls","calls":[...]}`.
+  - Put every required tool call for the next step into that `calls` array.
+  - When the task is done, return `{"type":"final","summary":"..."}`.
+  - When the task cannot proceed, return `{"type":"blocked","reason":"..."}`.
+  - When remaining work should move to a separate worktree, return `{"type":"needs_worker","task":"..."}`.
+- Do not bury tool calls inside prose or spread them across multiple messages. One turn should either ask for all needed tools or finish.
 - Near the tool budget limit, stop exploring and choose final, blocked, or needs_worker.
 
 Safety rules:

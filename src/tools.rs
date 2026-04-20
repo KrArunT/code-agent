@@ -41,6 +41,13 @@ pub enum ToolCall {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
 impl ToolCall {
     pub fn summary(&self) -> String {
         match self {
@@ -240,7 +247,11 @@ impl ToolRuntime {
         ))
     }
 
-    pub async fn web_search(&self, query: &str, max_results: usize) -> Result<String> {
+    pub async fn web_search_results(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<SearchResult>> {
         let max_results = max_results.clamp(1, 8);
         let url = Url::parse_with_params(
             "https://html.duckduckgo.com/html/",
@@ -269,6 +280,11 @@ impl ToolRuntime {
             .context("DuckDuckGo response was not text")?;
 
         let results = parse_duckduckgo_results(&html, max_results);
+        Ok(results)
+    }
+
+    pub async fn web_search(&self, query: &str, max_results: usize) -> Result<String> {
+        let results = self.web_search_results(query, max_results).await?;
         if results.is_empty() {
             return Ok(format!("no DuckDuckGo results found for `{query}`"));
         }
@@ -304,13 +320,6 @@ impl ToolRuntime {
         }
         Ok(joined)
     }
-}
-
-#[derive(Debug, Clone)]
-struct SearchResult {
-    title: String,
-    url: String,
-    snippet: String,
 }
 
 fn parse_duckduckgo_results(html: &str, max_results: usize) -> Vec<SearchResult> {
